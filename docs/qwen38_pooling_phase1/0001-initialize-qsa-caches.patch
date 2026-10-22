@@ -1,0 +1,595 @@
+From b01d71125322bf4338d1969a87c2f4340166dfec Mon Sep 17 00:00:00 2001
+From: jt <jt@example.com>
+Date: Thu, 22 Oct 2026 18:36:21 +0800
+Subject: [PATCH] fix: initialize QSA caches for AscendStore validation
+
+Bind unified caches from actual specs and preserve page stride and aligned slice offsets. Reuse the QSA page-major capability to expose dense K/V token planes. Add explicit initialization-only mode with real backend registration and no external reuse until hybrid-state restore is implemented. Cover view bounds, layout, and connector lifecycle; record TP8 eager validation.
+
+Signed-off-by: jt <jt@example.com>
+---
+ docs/qwen38_pooling_phase1.md                 |  91 ++++++++++
+ .../test_ascend_store_connector.py            |  55 +++++++
+ tests/ut/worker/test_model_runner_v1.py       | 155 ++++++++++++++++++
+ .../ascend_store/ascend_store_connector.py    |  47 +++++-
+ vllm_ascend/worker/model_runner_v1.py         |  86 +++++++---
+ 5 files changed, 411 insertions(+), 23 deletions(-)
+ create mode 100644 docs/qwen38_pooling_phase1.md
+
+diff --git a/docs/qwen38_pooling_phase1.md b/docs/qwen38_pooling_phase1.md
+new file mode 100644
+index 000000000..f5966074d
+--- /dev/null
++++ b/docs/qwen38_pooling_phase1.md
+@@ -0,0 +1,91 @@
++# Qwen3.8 Next: AscendStore initialization validation
++
++This change enables allocation and registration diagnostics for the QSA caches
++used by Qwen3.8 Next. External prefix reuse is not supported by this change:
++raw-indexer boundary snapshots and consistent hybrid-state restoration remain
++unimplemented.
++
++## Configuration
++
++Add the following settings to the existing AscendStore memcache configuration:
++
++```json
++{
++  "kv_connector": "AscendStoreConnector",
++  "kv_role": "kv_both",
++  "kv_connector_extra_config": {
++    "backend": "memcache",
++    "use_layerwise": false,
++    "load_async": false,
++    "initialization_only": true
++  }
++}
++```
++
++`initialization_only` is a boolean and defaults to `false`. When enabled it
++requires eager execution, non-layerwise operation, and synchronous loading
++configuration. It creates the real backend and registers device buffers, but
++returns no external matches and submits no external load/save tasks. The
++existing deferred backend initialization still runs after a real forward.
++Normal local prefix caching remains the engine's responsibility.
++
++A cache configuration containing a QSA `.indexer.raw_key_cache` owner is
++rejected unless this mode is enabled. This prevents normal external reuse from
++silently proceeding without the required raw-state restore contract.
++
++## Model runner rationale
++
++The independent allocation path previously called the legacy
++`get_kv_cache_shape` method, which the unified QSA backend does not implement.
++The model runner now binds unified views from the actual cache spec, retaining
++the number of states, state width, page stride, and allocation slice offset.
++The descriptor path uses the same binding helper.
++
++For a backend declaring `uses_qsa_page_major_kv_view`, a main KV page contains
++one dense K plane followed by one dense V plane. The returned K and V views
++share the allocation. This reuses the existing backend capability and tuple
++interface; no model-name dispatch or attention-kernel changes are introduced.
++Splitting a canonical `[B,H,N,K+V]` tensor instead would interleave K/V between
++tokens and violate GBSA's dense-token requirement, including in eager mode.
++Compressed and raw owners retain their own smaller state counts and widths.
++
++The helper checks dtype alignment, per-page payload, and bounds relative to
++the supplied allocation slice. It creates views during initialization only:
++there are no new device copies, allocations, synchronization points, or
++`Tensor.item()` calls in the inference hot path. Cache allocation gates and
++budgeting remain unchanged. Connector-enabled shared-backing/six-region
++support is deferred. Backends with the legacy shape method retain their
++existing construction path.
++
++## Validation on the image baseline
++
++Baseline Ascend commit: `2a450bd527f8a51be456de623369f7062a107427`.
++Baseline vLLM commit: `c4df37dfcc7f72ca41cd43801a468526ecf99a2b`.
++
++- Targeted model-runner cache tests: 56 passed, 73 deselected.
++- AscendStore connector and request-lifecycle tests: 137 passed, 12 skipped.
++- An unrelated prolog-weight budget test fails on the original baseline as
++  well because its NPU custom operator lacks a CPU implementation; it was
++  excluded from the targeted cache test selection.
++- Ruff 0.14.0 reports the same seven pre-existing import-order diagnostics on
++  the baseline and modified files. No new diagnostics were introduced.
++- TP8/DP1, eager, MTP3, local prefix caching and Mamba align mode: all eight
++  ranks completed memcache initialization and real HBM registration. Each rank
++  had 282 blocks, 76 underlying storages and 125 bound/transfer tensors. All
++  views were in bounds; transfer pointers, payload lengths and page strides
++  matched the live tensors, and pointers stayed unchanged across requests.
++- A short 16-token generation matched the baseline smoke's token IDs. Two
++  runs with a 768-token prompt plus 16 generated tokens also completed with
++  identical output IDs.
++
++Tests cover independent and descriptor view construction, multiple KV-head
++counts, padded pages, aligned allocation slices, K/V write isolation, raw
++position bit patterns, invalid bounds, configuration rejection, disabled
++external work, and real backend initialization in validation mode.
++
++The hardware smoke does not establish full numerical parity, external byte
++round trips, restored continuation, or speculative accept/reject correctness.
++Baseline repeatability and hybrid-state lifecycle validation remain open.
++The next stage must verify actual transfers into different destination blocks
++and restore main KV, compressed/raw indexer state, GDN and PLE at a common
++committed boundary before external reuse is enabled.
+diff --git a/tests/ut/distributed/ascend_store/test_ascend_store_connector.py b/tests/ut/distributed/ascend_store/test_ascend_store_connector.py
+index 2f4657770..fb67c4f80 100644
+--- a/tests/ut/distributed/ascend_store/test_ascend_store_connector.py
++++ b/tests/ut/distributed/ascend_store/test_ascend_store_connector.py
+@@ -136,6 +136,61 @@ class TestLookupKeyServer(unittest.TestCase):
+ 
+ 
+ class TestAscendStoreConnector(unittest.TestCase):
++    def test_initialization_only_disables_external_planning(self):
++        connector = AscendStoreConnector.__new__(AscendStoreConnector)
++        connector.initialization_only = True
++        connector.connector_scheduler = MagicMock()
++        self.assertEqual(connector.get_num_new_matched_tokens(MagicMock(), 0), (0, False))
++        connector.update_state_after_alloc(MagicMock(), MagicMock(), 0)
++        output = types.SimpleNamespace(preempted_req_ids={"preempted"}, finished_req_ids={"finished"})
++        metadata = connector.build_connector_meta(output)
++        self.assertEqual(metadata.requests, [])
++        self.assertEqual(metadata.loading_req_ids, set())
++        self.assertEqual(metadata.released_req_ids, {"preempted", "finished"})
++        self.assertEqual(connector.request_finished(MagicMock(), []), (False, None))
++        self.assertEqual(connector.request_finished_all_groups(MagicMock(), ([],)), (False, None))
++        self.assertEqual(connector.connector_scheduler.mock_calls, [])
++
++    def test_initialization_only_initializes_real_backend_without_io_tasks(self):
++        connector = AscendStoreConnector.__new__(AscendStoreConnector)
++        connector.initialization_only = True
++        connector.use_layerwise = False
++        connector.can_put = False
++        connector.connector_worker = MagicMock()
++        connector._get_connector_metadata = MagicMock(return_value=AscendConnectorMetadata(set()))
++        connector.start_load_kv(types.SimpleNamespace())
++        connector.wait_for_save()
++        self.assertEqual(connector.get_finished(set()), (set(), set()))
++        connector.connector_worker.ensure_store_initialized.assert_called_once_with()
++        connector.connector_worker.start_load_kv.assert_not_called()
++        connector.connector_worker.wait_for_save.assert_not_called()
++        connector.connector_worker.get_finished.assert_not_called()
++
++    def test_qsa_requires_explicit_initialization_only(self):
++        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
++
++        config = self._make_vllm_config(extra_config={"backend": "memcache"})
++        cache_config = types.SimpleNamespace(
++            kv_cache_groups=[
++                types.SimpleNamespace(layer_names=["language_model.model.layers.3.self_attn.indexer.raw_key_cache"])
++            ]
++        )
++        with self.assertRaisesRegex(ValueError, "raw-cache snapshot restore is not implemented"):
++            AscendStoreConnector(config, KVConnectorRole.SCHEDULER, cache_config)
++
++    def test_initialization_only_rejects_unsupported_modes(self):
++        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
++
++        for extra, eager in [({"use_layerwise": True}, True), ({"load_async": True}, True), ({}, False)]:
++            with self.subTest(extra=extra, eager=eager):
++                config = self._make_vllm_config(extra_config={"initialization_only": True, **extra})
++                config.model_config.enforce_eager = eager
++                with self.assertRaisesRegex(ValueError, "requires eager"):
++                    AscendStoreConnector(config, KVConnectorRole.WORKER)
++        config = self._make_vllm_config(extra_config={"initialization_only": "true"})
++        with self.assertRaisesRegex(ValueError, "must be a boolean"):
++            AscendStoreConnector(config, KVConnectorRole.WORKER)
++
+     def test_hybrid_failures_use_request_results(self):
+         for layerwise in (False, True):
+             with self.subTest(layerwise=layerwise):
+diff --git a/tests/ut/worker/test_model_runner_v1.py b/tests/ut/worker/test_model_runner_v1.py
+index f6c663f9b..be80b0ba4 100644
+--- a/tests/ut/worker/test_model_runner_v1.py
++++ b/tests/ut/worker/test_model_runner_v1.py
+@@ -16,6 +16,7 @@ from vllm.sampling_params import SamplingParams
+ from vllm.v1.attention.backends.utils import reorder_batch_to_split_decodes_and_prefills
+ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+ from vllm.v1.kv_cache_interface import (
++    CircularBufferSpec,
+     FullAttentionSpec,
+     HiddenStateCacheSpec,
+     KVCacheConfig,
+@@ -2663,6 +2664,160 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+             )
+         )
+ 
++    def test_transfer_native_views_keep_padding_and_aligned_slice_offset(self):
++        class NativeBackend:
++            @staticmethod
++            def get_name():
++                return "QWEN4_EXP_QSA_ASCEND"
++
++        page_bytes = 786432
++        num_blocks = 3
++        cases = [
++            (
++                FullAttentionSpec(
++                    block_size=768,
++                    num_kv_heads=1,
++                    head_size=256,
++                    head_size_v=256,
++                    dtype=torch.bfloat16,
++                    page_size_padded=page_bytes,
++                ),
++                (3, 1, 768, 512),
++            ),
++            (
++                MLAAttentionSpec(
++                    block_size=768,
++                    num_kv_heads=1,
++                    head_size=128,
++                    tokens_per_state=4,
++                    dtype=torch.bfloat16,
++                    page_size_padded=page_bytes,
++                ),
++                (3, 1, 192, 128),
++            ),
++            (
++                CircularBufferSpec(
++                    block_size=8,
++                    num_kv_heads=1,
++                    head_size=140,
++                    head_size_v=0,
++                    dtype=torch.bfloat16,
++                    page_size_padded=page_bytes,
++                ),
++                (3, 1, 8, 140),
++            ),
++        ]
++        for spec, expected_shape in cases:
++            with self.subTest(spec=type(spec).__name__):
++                name = "model.layers.3.self_attn.cache"
++                runner = self._build_runner()
++                runner.vllm_config.kv_transfer_config = SimpleNamespace(kv_connector="AscendStoreConnector")
++                runner._kv_cache_spec_attn_group_iterator = lambda spec=spec, name=name: [
++                    SimpleNamespace(kv_cache_spec=spec, backend=NativeBackend, layer_names=[name])
++                ]
++                config = KVCacheConfig(
++                    num_blocks=num_blocks,
++                    kv_cache_tensors=[
++                        KVCacheTensor(
++                            size=num_blocks * page_bytes,
++                            layers=[name],
++                            layer_stride=num_blocks * page_bytes,
++                            block_stride=page_bytes,
++                        )
++                    ],
++                    kv_cache_groups=[KVCacheGroupSpec([name], spec)],
++                )
++                prefix_bytes = 128
++                backing = torch.full((num_blocks * page_bytes + prefix_bytes * 2,), -7, dtype=torch.int8)
++                raw = backing[prefix_bytes:-prefix_bytes]
++                cache = runner._reshape_kv_cache_tensors(config, {name: raw})[name]
++                self.assertEqual(tuple(cache.shape), expected_shape)
++                self.assertEqual(cache.data_ptr(), raw.data_ptr())
++                self.assertEqual(cache.stride(0) * cache.element_size(), page_bytes)
++                cache.fill_(1)
++                self.assertTrue(torch.all(backing[:prefix_bytes] == -7))
++                self.assertTrue(torch.all(backing[-prefix_bytes:] == -7))
++                payload_bytes = int(np.prod(expected_shape[1:])) * cache.element_size()
++                if payload_bytes < page_bytes:
++                    for block in range(num_blocks):
++                        start = prefix_bytes + block * page_bytes + payload_bytes
++                        end = prefix_bytes + (block + 1) * page_bytes
++                        self.assertTrue(torch.all(backing[start:end] == -7))
++                if isinstance(spec, CircularBufferSpec):
++                    self.assertFalse(spec.prefix_cacheable)
++                    positions = cache[..., 128:].view(torch.int64)
++                    expected = torch.tensor([-(2**50), -7, 2**50], dtype=torch.int64)
++                    positions[:] = expected
++                    self.assertTrue(torch.equal(positions, expected.expand_as(positions)))
++                    self.assertEqual(positions.stride(0) * positions.element_size(), page_bytes)
++
++    def test_qsa_page_major_kv_views_have_dense_token_planes(self):
++        class PageMajorBackend:
++            uses_qsa_page_major_kv_view = True
++
++        for heads, packed in ((1, False), (1, True), (2, False), (2, True)):
++            with self.subTest(heads=heads, packed=packed):
++                spec = FullAttentionSpec(
++                    block_size=768,
++                    num_kv_heads=heads,
++                    head_size=256,
++                    head_size_v=256,
++                    dtype=torch.bfloat16,
++                    page_size_padded=1572864,
++                )
++                name = "model.layers.3.self_attn.attn"
++                runner = self._build_runner()
++                runner._page_strided_shared_backing = packed
++                runner.vllm_config.kv_transfer_config = SimpleNamespace(kv_connector="AscendStoreConnector")
++                runner._kv_cache_spec_attn_group_iterator = lambda spec=spec, name=name: [
++                    SimpleNamespace(kv_cache_spec=spec, backend=PageMajorBackend, layer_names=[name])
++                ]
++                config = KVCacheConfig(
++                    num_blocks=3,
++                    kv_cache_tensors=[
++                        KVCacheTensor(
++                            size=3 * spec.page_size_bytes,
++                            layers=[name],
++                            layer_stride=3 * spec.page_size_bytes,
++                            block_stride=spec.page_size_bytes,
++                        )
++                    ],
++                    kv_cache_groups=[KVCacheGroupSpec([name], spec)],
++                )
++                backing = torch.full((3 * spec.page_size_bytes + 256,), -7, dtype=torch.int8)
++                raw = backing[128:-128]
++                key, value = runner._reshape_kv_cache_tensors(config, {name: raw})[name]
++                page_payload = 768 * heads * 256 * 2
++                for cache in (key, value):
++                    self.assertEqual(tuple(cache.shape), (3, 768, heads, 256))
++                    self.assertEqual(cache.stride(), (spec.page_size_bytes // 2, heads * 256, 256, 1))
++                    self.assertEqual(cache.untyped_storage().data_ptr(), raw.untyped_storage().data_ptr())
++                self.assertEqual(key.data_ptr(), raw.data_ptr())
++                self.assertEqual(value.data_ptr() - key.data_ptr(), page_payload)
++                key.fill_(1)
++                value.fill_(2)
++                self.assertTrue(torch.all(key == 1))
++                self.assertTrue(torch.all(value == 2))
++                self.assertTrue(torch.all(backing[:128] == -7))
++                self.assertTrue(torch.all(backing[-128:] == -7))
++                for block in range(3):
++                    start = 128 + block * spec.page_size_bytes + 2 * page_payload
++                    end = 128 + (block + 1) * spec.page_size_bytes
++                    self.assertTrue(torch.all(backing[start:end] == -7))
++
++    def test_unified_view_checks_slice_bounds_and_page_stride(self):
++        runner = self._build_runner()
++        spec = CircularBufferSpec(block_size=8, num_kv_heads=1, head_size=140, head_size_v=0, dtype=torch.bfloat16)
++        storage = torch.empty(20000, dtype=torch.int8)
++        for raw, stride, offset in [(storage[:2240], 2240, 0), (storage, 2238, 0), (storage, 2240, -2)]:
++            with (
++                self.subTest(size=raw.numel(), stride=stride, offset=offset),
++                self.assertRaisesRegex(ValueError, "exceeds its allocation or block stride"),
++            ):
++                runner._unified_attention_cache_view(
++                    raw, spec, num_blocks=2, block_stride_bytes=stride, storage_offset_bytes=offset
++                )
++
+     @unittest.skipIf(
+         vllm_version_is("0.28.0"),
+         "vLLM #51718 only changed the main planner",
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+index 9c454dc81..92f172a5e 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+@@ -43,6 +43,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
+ )
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import DSparkPrefixKeys
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
++    AscendConnectorMetadata,
+     AscendStoreKVConnectorWorkerMetadata,
+ )
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
+@@ -111,6 +112,29 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
+         self.memcache_dp_init_barrier = extra_config.get("memcache_dp_init_barrier", True)
+         self.backend_name = extra_config.get("backend", "mooncake").lower()
++        self.initialization_only = extra_config.get("initialization_only", False)
++        if not isinstance(self.initialization_only, bool):
++            raise ValueError("initialization_only must be a boolean.")
++        has_qsa_raw_cache = kv_cache_config is not None and any(
++            name.endswith(".indexer.raw_key_cache")
++            for group in kv_cache_config.kv_cache_groups
++            for name in group.layer_names
++        )
++        if has_qsa_raw_cache and not self.initialization_only:
++            raise ValueError(
++                "QSA raw-cache snapshot restore is not implemented. "
++                "Set initialization_only=true to validate allocation and registration without external reuse."
++            )
++        if self.initialization_only:
++            if (
++                self.use_layerwise
++                or extra_config.get("load_async", False)
++                or not vllm_config.model_config.enforce_eager
++            ):
++                raise ValueError("initialization_only requires eager, use_layerwise=false and load_async=false.")
++            logger.warning(
++                "AscendStore initialization_only: registering real buffers; external lookup/load/save disabled."
++            )
+         self.layerwise_protocol = get_layerwise_protocol(self.backend_name)
+         self.layerwise_data_plane = get_layerwise_data_plane(self.layerwise_protocol)
+         self.use_block_key_layerwise = self.use_layerwise and self.layerwise_data_plane == "block_key"
+@@ -119,6 +143,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+             "save_decode_cache", False
+         )
+         self.can_put = self.kv_role in ("kv_producer", "kv_both") or self.consumer_is_to_put or self.save_decode_cache
++        if self.initialization_only:
++            self.can_put = False
+         if (
+             self.kv_role == "kv_consumer"
+             and self.save_decode_cache
+@@ -148,7 +174,9 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         self._mamba_state: Any = None
+         self.requires_mamba_state_copy_after_layer_load = self.use_layerwise
+         # Opt in only for synchronous bulk loads, not background retrieval.
+-        self.requires_mamba_state_copy_after_load = not self.use_layerwise and not extra_config.get("load_async", False)
++        self.requires_mamba_state_copy_after_load = (
++            not self.initialization_only and not self.use_layerwise and not extra_config.get("load_async", False)
++        )
+ 
+         self.connector_scheduler: KVPoolScheduler | None = None
+         self.connector_worker: KVPoolWorker | None = None
+@@ -233,10 +261,14 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         pass
+ 
+     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
++        if getattr(self, "initialization_only", False):
++            return 0, False
+         assert self.connector_scheduler is not None
+         return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
+ 
+     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
++        if getattr(self, "initialization_only", False):
++            return
+         assert self.connector_scheduler is not None
+         return self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+ 
+@@ -244,6 +276,10 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         self,
+         scheduler_output: SchedulerOutput,
+     ) -> KVConnectorMetadata:
++        if getattr(self, "initialization_only", False):
++            metadata = AscendConnectorMetadata(scheduler_output.preempted_req_ids)
++            metadata.released_req_ids.update(scheduler_output.finished_req_ids)
++            return metadata
+         assert self.connector_scheduler is not None
+         return self.connector_scheduler.build_connector_meta(scheduler_output)
+ 
+@@ -252,6 +288,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         request: "Request",
+         block_ids: list[int],
+     ) -> tuple[bool, dict[str, Any] | None]:
++        if getattr(self, "initialization_only", False):
++            return False, None
+         assert self.connector_scheduler is not None
+         return self.connector_scheduler.request_finished(request, block_ids)
+ 
+@@ -260,6 +298,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         request: "Request",
+         block_ids: tuple[list[int], ...],
+     ) -> tuple[bool, dict[str, Any] | None]:
++        if getattr(self, "initialization_only", False):
++            return False, None
+         assert self.connector_scheduler is not None
+         return self.connector_scheduler.request_finished_all_groups(request, block_ids)
+ 
+@@ -363,7 +403,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+                 for request in metadata.requests
+             ],
+         )
+-        self.connector_worker.start_load_kv(metadata)
++        if not getattr(self, "initialization_only", False):
++            self.connector_worker.start_load_kv(metadata)
+ 
+     def wait_for_layer_load(self, layer_name: str) -> None:
+         if not self.use_layerwise:
+@@ -441,6 +482,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+                 self.connector_worker.ensure_store_initialized()
+             finally:
+                 self._current_step_has_real_forward = False
++        if getattr(self, "initialization_only", False):
++            return set(), set()
+         done_sending, done_recving = self.connector_worker.get_finished(finished_req_ids, metadata)
+         return done_sending, done_recving
+ 
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 112e83b4e..99189d347 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -5401,6 +5401,50 @@ class NPUModelRunner(GPUModelRunner):
+             storage_offset=storage_offset_bytes // dtype_size,
+         )
+ 
++    def _unified_attention_cache_view(
++        self,
++        raw_tensor: torch.Tensor,
++        spec: AttentionSpec,
++        *,
++        num_blocks: int,
++        block_stride_bytes: int,
++        storage_offset_bytes: int = 0,
++        page_major_kv: bool = False,
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        """Bind main-native owners without dropping page padding or slice offsets.
++
++        The offset is relative to raw_tensor, including when the allocation is
++        an aligned slice. Bounds apply to that slice, not its larger storage.
++        """
++        dtype_size = get_dtype_size(spec.dtype)
++        if spec.state_content_size_bytes % dtype_size:
++            raise ValueError("Unified KV-cache state width must align to the cache dtype.")
++        if page_major_kv:
++            if spec.head_size != spec.head_size_v:
++                raise ValueError("QSA page-major K/V slots require symmetric head sizes.")
++            # GBSA needs dense tokens in each K/V plane. Splitting a canonical
++            # [B, H, N, K+V] tensor would leave K/V interleaved between tokens.
++            shape = (num_blocks, 2, spec.num_states, spec.num_kv_heads, spec.head_size)
++        else:
++            shape = (num_blocks, spec.num_heads, spec.num_states, spec.state_content_size_bytes // dtype_size)
++        payload_bytes = int(np.prod(shape[1:])) * dtype_size
++        span_bytes = (num_blocks - 1) * block_stride_bytes + payload_bytes if num_blocks else 0
++        if (
++            num_blocks < 0
++            or storage_offset_bytes < 0
++            or payload_bytes > block_stride_bytes
++            or storage_offset_bytes + span_bytes > raw_tensor.numel() * raw_tensor.element_size()
++        ):
++            raise ValueError("Unified KV-cache view exceeds its allocation or block stride.")
++        view = self._page_strided_tensor_view(
++            raw_tensor,
++            dtype=spec.dtype,
++            shape=shape,
++            block_stride_bytes=block_stride_bytes,
++            storage_offset_bytes=raw_tensor.storage_offset() * raw_tensor.element_size() + storage_offset_bytes,
++        )
++        return (view[:, 0], view[:, 1]) if page_major_kv else view
++
+     def _uses_single_raw_mla_cache(
+         self,
+         layer_name: str,
+@@ -6308,30 +6352,13 @@ class NPUModelRunner(GPUModelRunner):
+                         + layer_idx * descriptor.layer_stride
+                     )
+                     if self._uses_unified_attention_cache_view(attn_backend):
+-                        state_content_size = (
+-                            current_kv_cache_spec.state_content_size_bytes
+-                        )
+-                        dtype_size = get_dtype_size(current_kv_cache_spec.dtype)
+-                        if state_content_size % dtype_size:
+-                            raise ValueError(
+-                                "Unified KV-cache state width must align to "
+-                                "the cache dtype."
+-                            )
+-                        # Match vLLM main's canonical [B, H, N, C] view.  QSA
+-                        # compressed caches have N < block_size, while the QSA
+-                        # owner stores K and V together in C.
+-                        cache_shape = (
+-                            kv_cache_config.num_blocks,
+-                            current_kv_cache_spec.num_heads,
+-                            current_kv_cache_spec.num_states,
+-                            state_content_size // dtype_size,
+-                        )
+-                        kv_caches[layer_name] = self._page_strided_tensor_view(
++                        kv_caches[layer_name] = self._unified_attention_cache_view(
+                             raw_tensor,
+-                            dtype=current_kv_cache_spec.dtype,
+-                            shape=cache_shape,
++                            current_kv_cache_spec,
++                            num_blocks=kv_cache_config.num_blocks,
+                             block_stride_bytes=descriptor.block_stride,
+                             storage_offset_bytes=base_offset,
++                            page_major_kv=getattr(attn_backend, "uses_qsa_page_major_kv_view", False),
+                         )
+                         continue
+ 
+@@ -6373,6 +6400,23 @@ class NPUModelRunner(GPUModelRunner):
+                     kv_caches[layer_name] = (k_cache, v_cache)
+                     continue
+ 
++                if isinstance(current_kv_cache_spec, AttentionSpec) and self._uses_unified_attention_cache_view(
++                    attn_backend
++                ):
++                    # Transfer-enabled QSA uses independent padded allocations.
++                    # Main exposes dense K/V planes; compressed/raw have fewer
++                    # states than the logical token block and retain their width.
++                    raw_tensor = kv_cache_raw_tensors[layer_name]
++                    assert isinstance(raw_tensor, torch.Tensor)
++                    kv_caches[layer_name] = self._unified_attention_cache_view(
++                        raw_tensor,
++                        current_kv_cache_spec,
++                        num_blocks=kv_cache_config.num_blocks,
++                        block_stride_bytes=current_kv_cache_spec.page_size_bytes,
++                        page_major_kv=getattr(attn_backend, "uses_qsa_page_major_kv_view", False),
++                    )
++                    continue
++
+                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
+                 # encounter OOM issue
+                 if self._uses_page_strided_kv_layout(current_kv_cache_spec):
+-- 
+2.43.0
+

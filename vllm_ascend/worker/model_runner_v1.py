@@ -5401,6 +5401,50 @@ class NPUModelRunner(GPUModelRunner):
             storage_offset=storage_offset_bytes // dtype_size,
         )
 
+    def _unified_attention_cache_view(
+        self,
+        raw_tensor: torch.Tensor,
+        spec: AttentionSpec,
+        *,
+        num_blocks: int,
+        block_stride_bytes: int,
+        storage_offset_bytes: int = 0,
+        page_major_kv: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Bind main-native owners without dropping page padding or slice offsets.
+
+        The offset is relative to raw_tensor, including when the allocation is
+        an aligned slice. Bounds apply to that slice, not its larger storage.
+        """
+        dtype_size = get_dtype_size(spec.dtype)
+        if spec.state_content_size_bytes % dtype_size:
+            raise ValueError("Unified KV-cache state width must align to the cache dtype.")
+        if page_major_kv:
+            if spec.head_size != spec.head_size_v:
+                raise ValueError("QSA page-major K/V slots require symmetric head sizes.")
+            # GBSA needs dense tokens in each K/V plane. Splitting a canonical
+            # [B, H, N, K+V] tensor would leave K/V interleaved between tokens.
+            shape = (num_blocks, 2, spec.num_states, spec.num_kv_heads, spec.head_size)
+        else:
+            shape = (num_blocks, spec.num_heads, spec.num_states, spec.state_content_size_bytes // dtype_size)
+        payload_bytes = int(np.prod(shape[1:])) * dtype_size
+        span_bytes = (num_blocks - 1) * block_stride_bytes + payload_bytes if num_blocks else 0
+        if (
+            num_blocks < 0
+            or storage_offset_bytes < 0
+            or payload_bytes > block_stride_bytes
+            or storage_offset_bytes + span_bytes > raw_tensor.numel() * raw_tensor.element_size()
+        ):
+            raise ValueError("Unified KV-cache view exceeds its allocation or block stride.")
+        view = self._page_strided_tensor_view(
+            raw_tensor,
+            dtype=spec.dtype,
+            shape=shape,
+            block_stride_bytes=block_stride_bytes,
+            storage_offset_bytes=raw_tensor.storage_offset() * raw_tensor.element_size() + storage_offset_bytes,
+        )
+        return (view[:, 0], view[:, 1]) if page_major_kv else view
+
     def _uses_single_raw_mla_cache(
         self,
         layer_name: str,
@@ -6308,30 +6352,13 @@ class NPUModelRunner(GPUModelRunner):
                         + layer_idx * descriptor.layer_stride
                     )
                     if self._uses_unified_attention_cache_view(attn_backend):
-                        state_content_size = (
-                            current_kv_cache_spec.state_content_size_bytes
-                        )
-                        dtype_size = get_dtype_size(current_kv_cache_spec.dtype)
-                        if state_content_size % dtype_size:
-                            raise ValueError(
-                                "Unified KV-cache state width must align to "
-                                "the cache dtype."
-                            )
-                        # Match vLLM main's canonical [B, H, N, C] view.  QSA
-                        # compressed caches have N < block_size, while the QSA
-                        # owner stores K and V together in C.
-                        cache_shape = (
-                            kv_cache_config.num_blocks,
-                            current_kv_cache_spec.num_heads,
-                            current_kv_cache_spec.num_states,
-                            state_content_size // dtype_size,
-                        )
-                        kv_caches[layer_name] = self._page_strided_tensor_view(
+                        kv_caches[layer_name] = self._unified_attention_cache_view(
                             raw_tensor,
-                            dtype=current_kv_cache_spec.dtype,
-                            shape=cache_shape,
+                            current_kv_cache_spec,
+                            num_blocks=kv_cache_config.num_blocks,
                             block_stride_bytes=descriptor.block_stride,
                             storage_offset_bytes=base_offset,
+                            page_major_kv=getattr(attn_backend, "uses_qsa_page_major_kv_view", False),
                         )
                         continue
 
@@ -6371,6 +6398,23 @@ class NPUModelRunner(GPUModelRunner):
                         ),
                     )
                     kv_caches[layer_name] = (k_cache, v_cache)
+                    continue
+
+                if isinstance(current_kv_cache_spec, AttentionSpec) and self._uses_unified_attention_cache_view(
+                    attn_backend
+                ):
+                    # Transfer-enabled QSA uses independent padded allocations.
+                    # Main exposes dense K/V planes; compressed/raw have fewer
+                    # states than the logical token block and retain their width.
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert isinstance(raw_tensor, torch.Tensor)
+                    kv_caches[layer_name] = self._unified_attention_cache_view(
+                        raw_tensor,
+                        current_kv_cache_spec,
+                        num_blocks=kv_cache_config.num_blocks,
+                        block_stride_bytes=current_kv_cache_spec.page_size_bytes,
+                        page_major_kv=getattr(attn_backend, "uses_qsa_page_major_kv_view", False),
+                    )
                     continue
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may

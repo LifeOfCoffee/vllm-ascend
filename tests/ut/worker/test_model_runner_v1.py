@@ -16,6 +16,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.utils import reorder_batch_to_split_decodes_and_prefills
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
@@ -2662,6 +2663,160 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                 {"model.layers.0.self_attn.attn": spec},
             )
         )
+
+    def test_transfer_native_views_keep_padding_and_aligned_slice_offset(self):
+        class NativeBackend:
+            @staticmethod
+            def get_name():
+                return "QWEN4_EXP_QSA_ASCEND"
+
+        page_bytes = 786432
+        num_blocks = 3
+        cases = [
+            (
+                FullAttentionSpec(
+                    block_size=768,
+                    num_kv_heads=1,
+                    head_size=256,
+                    head_size_v=256,
+                    dtype=torch.bfloat16,
+                    page_size_padded=page_bytes,
+                ),
+                (3, 1, 768, 512),
+            ),
+            (
+                MLAAttentionSpec(
+                    block_size=768,
+                    num_kv_heads=1,
+                    head_size=128,
+                    tokens_per_state=4,
+                    dtype=torch.bfloat16,
+                    page_size_padded=page_bytes,
+                ),
+                (3, 1, 192, 128),
+            ),
+            (
+                CircularBufferSpec(
+                    block_size=8,
+                    num_kv_heads=1,
+                    head_size=140,
+                    head_size_v=0,
+                    dtype=torch.bfloat16,
+                    page_size_padded=page_bytes,
+                ),
+                (3, 1, 8, 140),
+            ),
+        ]
+        for spec, expected_shape in cases:
+            with self.subTest(spec=type(spec).__name__):
+                name = "model.layers.3.self_attn.cache"
+                runner = self._build_runner()
+                runner.vllm_config.kv_transfer_config = SimpleNamespace(kv_connector="AscendStoreConnector")
+                runner._kv_cache_spec_attn_group_iterator = lambda spec=spec, name=name: [
+                    SimpleNamespace(kv_cache_spec=spec, backend=NativeBackend, layer_names=[name])
+                ]
+                config = KVCacheConfig(
+                    num_blocks=num_blocks,
+                    kv_cache_tensors=[
+                        KVCacheTensor(
+                            size=num_blocks * page_bytes,
+                            layers=[name],
+                            layer_stride=num_blocks * page_bytes,
+                            block_stride=page_bytes,
+                        )
+                    ],
+                    kv_cache_groups=[KVCacheGroupSpec([name], spec)],
+                )
+                prefix_bytes = 128
+                backing = torch.full((num_blocks * page_bytes + prefix_bytes * 2,), -7, dtype=torch.int8)
+                raw = backing[prefix_bytes:-prefix_bytes]
+                cache = runner._reshape_kv_cache_tensors(config, {name: raw})[name]
+                self.assertEqual(tuple(cache.shape), expected_shape)
+                self.assertEqual(cache.data_ptr(), raw.data_ptr())
+                self.assertEqual(cache.stride(0) * cache.element_size(), page_bytes)
+                cache.fill_(1)
+                self.assertTrue(torch.all(backing[:prefix_bytes] == -7))
+                self.assertTrue(torch.all(backing[-prefix_bytes:] == -7))
+                payload_bytes = int(np.prod(expected_shape[1:])) * cache.element_size()
+                if payload_bytes < page_bytes:
+                    for block in range(num_blocks):
+                        start = prefix_bytes + block * page_bytes + payload_bytes
+                        end = prefix_bytes + (block + 1) * page_bytes
+                        self.assertTrue(torch.all(backing[start:end] == -7))
+                if isinstance(spec, CircularBufferSpec):
+                    self.assertFalse(spec.prefix_cacheable)
+                    positions = cache[..., 128:].view(torch.int64)
+                    expected = torch.tensor([-(2**50), -7, 2**50], dtype=torch.int64)
+                    positions[:] = expected
+                    self.assertTrue(torch.equal(positions, expected.expand_as(positions)))
+                    self.assertEqual(positions.stride(0) * positions.element_size(), page_bytes)
+
+    def test_qsa_page_major_kv_views_have_dense_token_planes(self):
+        class PageMajorBackend:
+            uses_qsa_page_major_kv_view = True
+
+        for heads, packed in ((1, False), (1, True), (2, False), (2, True)):
+            with self.subTest(heads=heads, packed=packed):
+                spec = FullAttentionSpec(
+                    block_size=768,
+                    num_kv_heads=heads,
+                    head_size=256,
+                    head_size_v=256,
+                    dtype=torch.bfloat16,
+                    page_size_padded=1572864,
+                )
+                name = "model.layers.3.self_attn.attn"
+                runner = self._build_runner()
+                runner._page_strided_shared_backing = packed
+                runner.vllm_config.kv_transfer_config = SimpleNamespace(kv_connector="AscendStoreConnector")
+                runner._kv_cache_spec_attn_group_iterator = lambda spec=spec, name=name: [
+                    SimpleNamespace(kv_cache_spec=spec, backend=PageMajorBackend, layer_names=[name])
+                ]
+                config = KVCacheConfig(
+                    num_blocks=3,
+                    kv_cache_tensors=[
+                        KVCacheTensor(
+                            size=3 * spec.page_size_bytes,
+                            layers=[name],
+                            layer_stride=3 * spec.page_size_bytes,
+                            block_stride=spec.page_size_bytes,
+                        )
+                    ],
+                    kv_cache_groups=[KVCacheGroupSpec([name], spec)],
+                )
+                backing = torch.full((3 * spec.page_size_bytes + 256,), -7, dtype=torch.int8)
+                raw = backing[128:-128]
+                key, value = runner._reshape_kv_cache_tensors(config, {name: raw})[name]
+                page_payload = 768 * heads * 256 * 2
+                for cache in (key, value):
+                    self.assertEqual(tuple(cache.shape), (3, 768, heads, 256))
+                    self.assertEqual(cache.stride(), (spec.page_size_bytes // 2, heads * 256, 256, 1))
+                    self.assertEqual(cache.untyped_storage().data_ptr(), raw.untyped_storage().data_ptr())
+                self.assertEqual(key.data_ptr(), raw.data_ptr())
+                self.assertEqual(value.data_ptr() - key.data_ptr(), page_payload)
+                key.fill_(1)
+                value.fill_(2)
+                self.assertTrue(torch.all(key == 1))
+                self.assertTrue(torch.all(value == 2))
+                self.assertTrue(torch.all(backing[:128] == -7))
+                self.assertTrue(torch.all(backing[-128:] == -7))
+                for block in range(3):
+                    start = 128 + block * spec.page_size_bytes + 2 * page_payload
+                    end = 128 + (block + 1) * spec.page_size_bytes
+                    self.assertTrue(torch.all(backing[start:end] == -7))
+
+    def test_unified_view_checks_slice_bounds_and_page_stride(self):
+        runner = self._build_runner()
+        spec = CircularBufferSpec(block_size=8, num_kv_heads=1, head_size=140, head_size_v=0, dtype=torch.bfloat16)
+        storage = torch.empty(20000, dtype=torch.int8)
+        for raw, stride, offset in [(storage[:2240], 2240, 0), (storage, 2238, 0), (storage, 2240, -2)]:
+            with (
+                self.subTest(size=raw.numel(), stride=stride, offset=offset),
+                self.assertRaisesRegex(ValueError, "exceeds its allocation or block stride"),
+            ):
+                runner._unified_attention_cache_view(
+                    raw, spec, num_blocks=2, block_stride_bytes=stride, storage_offset_bytes=offset
+                )
 
     @unittest.skipIf(
         vllm_version_is("0.28.0"),

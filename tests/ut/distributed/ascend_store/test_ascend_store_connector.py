@@ -136,6 +136,61 @@ class TestLookupKeyServer(unittest.TestCase):
 
 
 class TestAscendStoreConnector(unittest.TestCase):
+    def test_initialization_only_disables_external_planning(self):
+        connector = AscendStoreConnector.__new__(AscendStoreConnector)
+        connector.initialization_only = True
+        connector.connector_scheduler = MagicMock()
+        self.assertEqual(connector.get_num_new_matched_tokens(MagicMock(), 0), (0, False))
+        connector.update_state_after_alloc(MagicMock(), MagicMock(), 0)
+        output = types.SimpleNamespace(preempted_req_ids={"preempted"}, finished_req_ids={"finished"})
+        metadata = connector.build_connector_meta(output)
+        self.assertEqual(metadata.requests, [])
+        self.assertEqual(metadata.loading_req_ids, set())
+        self.assertEqual(metadata.released_req_ids, {"preempted", "finished"})
+        self.assertEqual(connector.request_finished(MagicMock(), []), (False, None))
+        self.assertEqual(connector.request_finished_all_groups(MagicMock(), ([],)), (False, None))
+        self.assertEqual(connector.connector_scheduler.mock_calls, [])
+
+    def test_initialization_only_initializes_real_backend_without_io_tasks(self):
+        connector = AscendStoreConnector.__new__(AscendStoreConnector)
+        connector.initialization_only = True
+        connector.use_layerwise = False
+        connector.can_put = False
+        connector.connector_worker = MagicMock()
+        connector._get_connector_metadata = MagicMock(return_value=AscendConnectorMetadata(set()))
+        connector.start_load_kv(types.SimpleNamespace())
+        connector.wait_for_save()
+        self.assertEqual(connector.get_finished(set()), (set(), set()))
+        connector.connector_worker.ensure_store_initialized.assert_called_once_with()
+        connector.connector_worker.start_load_kv.assert_not_called()
+        connector.connector_worker.wait_for_save.assert_not_called()
+        connector.connector_worker.get_finished.assert_not_called()
+
+    def test_qsa_requires_explicit_initialization_only(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+        config = self._make_vllm_config(extra_config={"backend": "memcache"})
+        cache_config = types.SimpleNamespace(
+            kv_cache_groups=[
+                types.SimpleNamespace(layer_names=["language_model.model.layers.3.self_attn.indexer.raw_key_cache"])
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "raw-cache snapshot restore is not implemented"):
+            AscendStoreConnector(config, KVConnectorRole.SCHEDULER, cache_config)
+
+    def test_initialization_only_rejects_unsupported_modes(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+        for extra, eager in [({"use_layerwise": True}, True), ({"load_async": True}, True), ({}, False)]:
+            with self.subTest(extra=extra, eager=eager):
+                config = self._make_vllm_config(extra_config={"initialization_only": True, **extra})
+                config.model_config.enforce_eager = eager
+                with self.assertRaisesRegex(ValueError, "requires eager"):
+                    AscendStoreConnector(config, KVConnectorRole.WORKER)
+        config = self._make_vllm_config(extra_config={"initialization_only": "true"})
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            AscendStoreConnector(config, KVConnectorRole.WORKER)
+
     def test_hybrid_failures_use_request_results(self):
         for layerwise in (False, True):
             with self.subTest(layerwise=layerwise):

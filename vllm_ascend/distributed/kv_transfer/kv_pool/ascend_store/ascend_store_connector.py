@@ -43,6 +43,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import DSparkPrefixKeys
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    AscendConnectorMetadata,
     AscendStoreKVConnectorWorkerMetadata,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
@@ -111,6 +112,29 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
         self.memcache_dp_init_barrier = extra_config.get("memcache_dp_init_barrier", True)
         self.backend_name = extra_config.get("backend", "mooncake").lower()
+        self.initialization_only = extra_config.get("initialization_only", False)
+        if not isinstance(self.initialization_only, bool):
+            raise ValueError("initialization_only must be a boolean.")
+        has_qsa_raw_cache = kv_cache_config is not None and any(
+            name.endswith(".indexer.raw_key_cache")
+            for group in kv_cache_config.kv_cache_groups
+            for name in group.layer_names
+        )
+        if has_qsa_raw_cache and not self.initialization_only:
+            raise ValueError(
+                "QSA raw-cache snapshot restore is not implemented. "
+                "Set initialization_only=true to validate allocation and registration without external reuse."
+            )
+        if self.initialization_only:
+            if (
+                self.use_layerwise
+                or extra_config.get("load_async", False)
+                or not vllm_config.model_config.enforce_eager
+            ):
+                raise ValueError("initialization_only requires eager, use_layerwise=false and load_async=false.")
+            logger.warning(
+                "AscendStore initialization_only: registering real buffers; external lookup/load/save disabled."
+            )
         self.layerwise_protocol = get_layerwise_protocol(self.backend_name)
         self.layerwise_data_plane = get_layerwise_data_plane(self.layerwise_protocol)
         self.use_block_key_layerwise = self.use_layerwise and self.layerwise_data_plane == "block_key"
@@ -119,6 +143,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             "save_decode_cache", False
         )
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or self.consumer_is_to_put or self.save_decode_cache
+        if self.initialization_only:
+            self.can_put = False
         if (
             self.kv_role == "kv_consumer"
             and self.save_decode_cache
@@ -148,7 +174,9 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self._mamba_state: Any = None
         self.requires_mamba_state_copy_after_layer_load = self.use_layerwise
         # Opt in only for synchronous bulk loads, not background retrieval.
-        self.requires_mamba_state_copy_after_load = not self.use_layerwise and not extra_config.get("load_async", False)
+        self.requires_mamba_state_copy_after_load = (
+            not self.initialization_only and not self.use_layerwise and not extra_config.get("load_async", False)
+        )
 
         self.connector_scheduler: KVPoolScheduler | None = None
         self.connector_worker: KVPoolWorker | None = None
@@ -233,10 +261,14 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         pass
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+        if getattr(self, "initialization_only", False):
+            return 0, False
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
+        if getattr(self, "initialization_only", False):
+            return
         assert self.connector_scheduler is not None
         return self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
 
@@ -244,6 +276,10 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
+        if getattr(self, "initialization_only", False):
+            metadata = AscendConnectorMetadata(scheduler_output.preempted_req_ids)
+            metadata.released_req_ids.update(scheduler_output.finished_req_ids)
+            return metadata
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
 
@@ -252,6 +288,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
+        if getattr(self, "initialization_only", False):
+            return False, None
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
@@ -260,6 +298,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
+        if getattr(self, "initialization_only", False):
+            return False, None
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished_all_groups(request, block_ids)
 
@@ -363,7 +403,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 for request in metadata.requests
             ],
         )
-        self.connector_worker.start_load_kv(metadata)
+        if not getattr(self, "initialization_only", False):
+            self.connector_worker.start_load_kv(metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:
@@ -441,6 +482,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 self.connector_worker.ensure_store_initialized()
             finally:
                 self._current_step_has_real_forward = False
+        if getattr(self, "initialization_only", False):
+            return set(), set()
         done_sending, done_recving = self.connector_worker.get_finished(finished_req_ids, metadata)
         return done_sending, done_recving
 

@@ -199,13 +199,14 @@ MODEL_CASES = (
             # single-chip IPC budget by keeping only the first 8 experts.
             "n_routed_experts": 8,
         },
-        skip_reason=(
-            "GLM-5.1's SFA runtime state does not survive the live-update "
-            "lifecycle yet: the same-chip lane fails its first update once the "
-            "engine has been through a level-2 sleep/wake cycle (#16725), and the "
-            "SFA runtime-weight refresh is still pending as well; both lanes skip "
-            "the case until those land"
-        ),
+        # No skip_reason left. The "SFA runtime-weight refresh" this case used to
+        # wait for is not a prerequisite: the state that *is* weight-derived (the
+        # KPool indexer's FP32 _wk/_gate/_norm copies, SFA's W_UK_T/W_UV) is
+        # re-derived by the layerwise reload, which finalizes deferred attention
+        # layers through process_weights_after_loading. The level-2 half is fixed
+        # by owning SFA/MLA runtime state as non-persistent buffers: the LI C8
+        # Hadamard matrices, the DCP remap order/sentinel, the DeepSeek-V4 DSA RoPE
+        # tables and the interleaved RoPE tables the MLA/SFA rope lookups read.
     ),
 )
 
@@ -264,6 +265,32 @@ def pytest_model_cases() -> list[Any]:
     import pytest
 
     return [pytest.param(case, id=case.id, marks=pytest.mark.e2e_model(case.model)) for case in MODEL_CASES]
+
+
+# The packed lanes are disabled here because the packed HCCL transfer is flaky: a
+# chunk is received on an NPU stream of its own while the weight loading that reads
+# it is issued on another, and the layerwise reload - which retains a chunk's
+# tensors until a later chunk completes the layer - has no ordering between the
+# two, so the reloaded model can diverge from normal startup loading of the same
+# payload.
+#
+# Every occurrence seen so far is
+# `test_hccl_weight_transfer_transaction[packed-qwen3.5-35b-a3b-moe-layout]` with the
+# *second* live update diverging, while the unpacked lane of the very same case
+# passes in the same job: #18726 (run 38570793020, attempts 1 and 2) and the daily
+# lanes - main@9f9da5562 run 38186343470, main@8194eceae run 38325024027,
+# main@75bfb7622 runs 38657430708 and 38679145716. The failing case's lane is the
+# vLLM *main* pairing on two of those days and the vLLM v0.30.0 pairing on the
+# others, and `vllm_ascend/distributed/weight_transfer/` is byte-identical on `main`
+# and on this branch, so this is not specific to one branch. A fix is proposed in
+# #18763; drop the skip and re-enable the `packed` parametrization once it lands.
+# Until then `main` is likely to need the same skip.
+PACKED_LANE_SKIP_REASON = (
+    "packed weight transfer is flaky: the receive buffer of a chunk is filled and "
+    "loaded on different NPU streams, so the layerwise reload can read tensors "
+    "retained from an earlier chunk without ordering against their allocation "
+    "(#18726; fix proposed in #18763)"
+)
 
 
 _ENGINES_REGISTERED = False

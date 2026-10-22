@@ -22,40 +22,23 @@ ARG CANN_VERSION="9.1.0"
 FROM ${CANN_QUAY_URL}:${CANN_VERSION}-910b-ubuntu22.04-py3.12
 
 # Build-time arguments (declared once at the top of the stage for clarity).
-# PIP_INDEX_URL (optional): Primary pip index mirror URL for Python packages.
-ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-# PUBLIC_PIP_INDEX_URL (optional): Public pip index used to restore config after internal-mirror builds.
-ARG PUBLIC_PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-# MOONCAKE_INDEX_URL (optional): Extra pip index URL for the mooncake-transfer-engine package.
-ARG MOONCAKE_INDEX_URL="https://mirrors.aliyun.com/pypi/web/simple"
 # PYTORCH_INDEX_URL (optional): Extra pip index URL for PyTorch wheels.
 ARG PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cpu/"
 # ASCEND_INDEX_URL (optional): Extra pip index URL for Ascend/CANN Python packages.
 ARG ASCEND_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pypi"
-# APTMIRROR (optional): Internal apt mirror host; empty to use the public Ubuntu mirrors.
-ARG APTMIRROR=""
-# GIT_PROXY (optional): Internal GitHub proxy prefix; empty for direct GitHub access.
-ARG GIT_PROXY=""
-# PIP_TRUSTED_HOST (optional): Extra pip trusted host; empty for none.
-ARG PIP_TRUSTED_HOST=""
 # MOONCAKE_TAG (optional): Version tag of the mooncake-transfer-engine-npu package.
-ARG MOONCAKE_TAG=0.3.11.post1
+ARG MOONCAKE_TAG=v0.3.14-rc1
+ARG MOONCAKE_OBS_PREFIX="https://mindie.obs.cn-north-4.myhuaweicloud.com/buildtools/docker_images_tools/Mooncake/v0.3.14.rc1"
 # VLLM_REPO (optional): Git repository URL of vLLM.
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 # VLLM_TAG (optional): vLLM release tag to clone when VLLM_COMMIT is empty.
-ARG VLLM_TAG=v0.29.0
+ARG VLLM_TAG=v0.31.0
 # VLLM_COMMIT (optional): Exact vLLM commit to build; empty to fall back to VLLM_TAG.
 ARG VLLM_COMMIT=""
 # SOC_VERSION (optional): Ascend SoC version used for custom kernel compilation.
 ARG SOC_VERSION="ascend910b1"
 # COMPILE_CUSTOM_KERNELS (optional): Whether to compile custom Ascend kernels (1 = yes, 0 = no).
 ARG COMPILE_CUSTOM_KERNELS=1
-# RUSTUP_DIST_SERVER (optional, empty if unset): Internal rustup dist server mirror for the Rust frontend.
-ARG RUSTUP_DIST_SERVER
-# RUSTUP_UPDATE_ROOT (optional, empty if unset): Internal rustup update root mirror for the Rust frontend.
-ARG RUSTUP_UPDATE_ROOT
-# CRATES_IO_INDEX (optional): Internal crates.io sparse index mirror; empty to use the public index.
-ARG CRATES_IO_INDEX=""
 # BUILD_TYPE (optional): Build type: 'release' or 'daily' (daily installs extra deps).
 ARG BUILD_TYPE="release"
 # MEMCACHE_VERSION (optional, empty if unset): memcache package version for daily builds.
@@ -76,33 +59,44 @@ ARG TRITON_ASCEND_VERSION
 ARG TRITON_ASCEND_PACKAGE_VERSION
 # DAILY_DEPS_MODE (optional): Daily deps install mode: 'full' or 'torch_npu_only'.
 ARG DAILY_DEPS_MODE="full"
-
+# flash-linear-attention-npu
+ARG FLA_VERSION="26.9.1+dev812ccc8"
+ARG FLA_RELEASE_TAG="v26.9.1-20261015-121515"
 WORKDIR /workspace
-
-# Install clang-15 (for triton-ascend) and Mooncake
-RUN if [ -n "$APTMIRROR" ]; then \
-        cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
-        sed -Ei "s@(ports|archive).ubuntu.com@${APTMIRROR#http://}@g" /etc/apt/sources.list; \
-    fi && \
-    apt-get update -y && \
-    apt-get install -y git vim wget curl protobuf-compiler libprotobuf-dev net-tools gcc g++ cmake numactl libnuma-dev libibverbs-dev libjemalloc2 libhiredis-dev clang-15 && \
+# Install clang-15 (for triton-ascend)
+RUN apt-get update -y && \
+    apt-get install -y git vim wget curl protobuf-compiler libprotobuf-dev net-tools gcc g++ cmake numactl libnuma-dev libibverbs-dev libhiredis-dev clang-15 && \
     update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 && \
     update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 && \
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
-    python3 -m pip install mooncake-transfer-engine-npu==${MOONCAKE_TAG} --extra-index-url ${MOONCAKE_INDEX_URL} && \
-    if [ -n "$APTMIRROR" ]; then mv /etc/apt/sources.list.bak /etc/apt/sources.list; fi && \
     rm -rf /var/cache/apt/* && \
     rm -rf /var/lib/apt/lists/*
 
+# ====== Install Mooncake ======
+ARG TARGETPLATFORM
+RUN ARCH=${TARGETPLATFORM:-$(uname -m)}; \
+    case "$ARCH" in \
+        "linux/arm64"|"aarch64") \
+            MOONCAKE_WHL="mooncake_transfer_engine-0.3.13-cp312-cp312-manylinux_2_35_aarch64.whl" ;; \
+        "linux/amd64"|"x86_64") \
+            MOONCAKE_WHL="mooncake_transfer_engine-0.3.13-cp312-cp312-manylinux_2_35_x86_64.whl" ;; \
+        *) echo "Unsupported arch for mooncake: $ARCH" && exit 1 ;; \
+    esac && \
+    MOONCAKE_URL="${MOONCAKE_OBS_PREFIX}/${MOONCAKE_WHL}" && \
+    echo "Download mooncake whl: ${MOONCAKE_URL}" && \
+    wget -q --no-check-certificate "${MOONCAKE_URL}" -P /tmp && \
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    pip install /tmp/${MOONCAKE_WHL} --force-reinstall --no-deps && \
+    echo "***********check mooncake-transfer-engine-npu version***********" && \
+    pip show mooncake-transfer-engine && \
+    rm -rf /tmp/${MOONCAKE_WHL} && \
+    pip cache purge
+
 # Install modelscope (for fast download) and ray (for multinode)
-RUN pip config set global.index-url ${PIP_INDEX_URL} && \
-    if [ -n "$PIP_TRUSTED_HOST" ]; then pip config set global.trusted-host "$PIP_TRUSTED_HOST"; fi && \
-    python3 -m pip install 'modelscope<1.38' 'ray>=2.47.1,<=2.48.0' 'protobuf>3.20.0' && \
+RUN python3 -m pip install 'modelscope<1.38' 'ray>=2.47.1,<=2.48.0' 'protobuf>3.20.0' && \
     python3 -m pip cache purge
 
 # Install vLLM
-RUN if [ -n "$GIT_PROXY" ]; then git config --global url."${GIT_PROXY}https://github.com/".insteadOf https://github.com/; fi && \
-    if [ -n "$VLLM_COMMIT" ]; then \
+RUN if [ -n "$VLLM_COMMIT" ]; then \
       git init /vllm-workspace/vllm && \
       git -C /vllm-workspace/vllm fetch --depth 1 $VLLM_REPO "$VLLM_COMMIT" && \
       git -C /vllm-workspace/vllm checkout FETCH_HEAD; \
@@ -121,57 +115,45 @@ ENV SOC_VERSION=$SOC_VERSION \
     TASK_QUEUE_ENABLE=1 \
     OMP_NUM_THREADS=1
 COPY . /vllm-workspace/vllm-ascend/
-
 RUN export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" && \
     export VLLM_BATCH_INVARIANT=1 && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
     python3 -m pip install -e /vllm-workspace/vllm-ascend/ --extra-index-url ${PYTORCH_INDEX_URL} && \
     python3 -m pip uninstall -y triton triton-ascend && \
-    python3 -m pip install triton-ascend==3.2.2 --extra-index-url ${ASCEND_INDEX_URL} && \
+    python3 -m pip install triton-ascend==3.6.0 --extra-index-url ${ASCEND_INDEX_URL} && \
     python3 -m pip install concurrent-log-handler && \
     python3 -m pip cache purge
 
+# Install flash-linear-attention-npu (v26.9.1-beta2, A2 ascend910b)
+ARG TARGETPLATFORM
+RUN ARCH=${TARGETPLATFORM:-$(uname -m)}; \
+    case "$ARCH" in \
+        "linux/arm64"|"aarch64") \
+            FLA_WHL="flash_linear_attention_npu_a2-${FLA_VERSION}-py3-none-manylinux_2_34_aarch64.whl"; \
+            FLA_SHA256="b899817028eb6802e1491f9f585ef3e14d375e39dc17d5310891445ea49b8fc1" ;; \
+        "linux/amd64"|"x86_64") \
+            FLA_WHL="flash_linear_attention_npu_a2-${FLA_VERSION}-py3-none-manylinux_2_34_x86_64.whl"; \
+            FLA_SHA256="6aee7a91cc3530009de9adca218d16e842eda1101cdda9c111a8b68830067bb7" ;; \
+        *) echo "Unsupported arch for flash-linear-attention-npu: $ARCH" && exit 1 ;; \
+    esac && \
+    FLA_DOWNLOAD_URL="https://github.com/flashserve/flash-linear-attention-npu/releases/download/${FLA_RELEASE_TAG}/${FLA_WHL}" && \
+    wget --quiet "$FLA_DOWNLOAD_URL" -O /tmp/${FLA_WHL} && \
+    echo "${FLA_SHA256}  /tmp/${FLA_WHL}" | sha256sum --check && \
+    python3 -m pip install --force-reinstall --no-deps /tmp/${FLA_WHL} && \
+    rm -f /tmp/${FLA_WHL} && \
+    python3 -m pip cache purge
+
 # Install _rust_tool_parser for the Rust frontend.
-# When an internal RUSTUP_DIST_SERVER mirror is provided (CI builds), pre-install
-# rustup via the rustup-init.sh bootstrap from the mirror so build_rust.sh
-# doesn't reach the public https://sh.rustup.rs (unreachable from build
-# containers). The bootstrap downloader hardcodes --proto '=https' (curl) and
-# --https-only (wget), so strip them via sed to allow the internal http mirror.
-# External builds without the mirror keep the original public install path. The
-# default toolchain is read from vllm's rust-toolchain.toml (falling back to
-# stable).
-RUN if [ -n "$RUSTUP_DIST_SERVER" ]; then \
-      TOOLCHAIN=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' /vllm-workspace/vllm/rust-toolchain.toml) && \
-      curl -fsSL "${RUSTUP_UPDATE_ROOT}/rustup-init.sh" -o /tmp/rustup-init.sh && \
-      sed -i "s/--proto '=https'//g; s/--https-only//g" /tmp/rustup-init.sh && \
-      sh /tmp/rustup-init.sh -y --default-toolchain "${TOOLCHAIN:-stable}" && \
-      rm /tmp/rustup-init.sh; \
-    fi
+# The default toolchain is read from vllm's rust-toolchain.toml (falling back
+# to stable).
 ENV PATH="/root/.cargo/bin:$PATH"
-# Configure cargo only for internal (CI) builds: route git dependencies through
-# GIT_PROXY and the crates.io sparse index through an internal mirror. External
-# builds leave these build-args empty and keep the default public endpoints.
-RUN if [ -n "$GIT_PROXY" ] || [ -n "$CRATES_IO_INDEX" ]; then \
-      mkdir -p $HOME/.cargo; \
-      if [ -n "$GIT_PROXY" ]; then \
-        printf '[net]\ngit-fetch-with-cli = true\n' > $HOME/.cargo/config.toml; \
-      else \
-        : > $HOME/.cargo/config.toml; \
-      fi; \
-      if [ -n "$CRATES_IO_INDEX" ]; then \
-        printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+%s"\n' "$CRATES_IO_INDEX" >> $HOME/.cargo/config.toml; \
-      fi; \
-    fi
 RUN cd /vllm-workspace/vllm && \
     export PROTOC_INCLUDE=/usr/include && \
-    if [ -n "${RUSTUP_DIST_SERVER}" ]; then export RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER}"; fi && \
-    if [ -n "${RUSTUP_UPDATE_ROOT}" ]; then export RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT}"; fi && \
-    python3 -m pip install setuptools-rust && \
-    ./build_rust.sh
+    python3 -m pip install -r requirements/build/rust.txt && \
+    bash tools/build_rust.sh
 
 # Append `libascend_hal.so` path (devlib) to LD_LIBRARY_PATH
-RUN echo "export LD_PRELOAD=/usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2:$LD_PRELOAD" >> ~/.bashrc
 RUN echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib" >> ~/.bashrc
 
 # ===== Conditional installation based on BUILD_TYPE =====
@@ -183,15 +165,5 @@ RUN if [ "$BUILD_TYPE" = "daily" ]; then \
     else \
         echo "Building release version without daily packages"; \
     fi && rm -f /tmp/install_daily_deps.sh
-
-# Restore public package sources in the final image.
-# Only builds that used internal mirrors (CI) need this: their build-args
-# (PIP_INDEX_URL, GIT_PROXY, CRATES_IO_INDEX) point to cluster-internal hosts
-# that are unreachable from the published image. This step resets pip/cargo/git
-# to public defaults; the guard below skips it entirely for default builds.
-# The script ships with the repo and is already copied in by `COPY .` above.
-RUN if [ -n "$GIT_PROXY" ] || [ -n "$CRATES_IO_INDEX" ] || [ "$PIP_INDEX_URL" != "$PUBLIC_PIP_INDEX_URL" ]; then \
-        bash /vllm-workspace/vllm-ascend/.github/workflows/scripts/restore_public_sources.sh; \
-    fi
 
 CMD ["/bin/bash"]

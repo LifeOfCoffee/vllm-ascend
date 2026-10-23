@@ -1682,5 +1682,75 @@ class TestKVPoolSchedulerLayerwiseReachableLookup(unittest.TestCase):
         self.assertEqual(hit, 16)
 
 
+class TestExactBoundaryState(unittest.TestCase):
+    def _make_scheduler(self):
+        scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+        scheduler.use_exact_boundary_state = True
+        scheduler.can_put = True
+        scheduler.use_hybrid = True
+        scheduler.use_layerwise = False
+        scheduler.kv_role = "kv_both"
+        scheduler.num_speculative_blocks_by_group = {1: 0, 2: 0}
+        scheduler.cache_transfer_granularity = 32
+        scheduler.hash_block_size = 16
+        scheduler.original_block_size = [16, 32, 32]
+        scheduler.kv_cache_group_ids = [0, 1, 2]
+        scheduler.enable_kv_events = False
+        scheduler._block_pool = SimpleNamespace(blocks=list(range(100)), touch=MagicMock())
+        scheduler.sending_event_id = 0
+        scheduler.sending_events, scheduler.sending_blocks = {}, {}
+        request = SimpleNamespace(
+            block_hashes=["h0", "h1", "h2", "h3"],
+            prompt_token_ids=list(range(65)),
+            all_token_ids=list(range(65)),
+            num_computed_tokens=64,
+        )
+        scheduler._unfinished_requests = {"r1": (request, [[99], [98], [97]])}
+        scheduler._request_trackers = {"r1": SimpleNamespace(allocated_block_ids_by_group=[])}
+        return scheduler
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_lookup_queries_the_actual_restore_boundary_before_the_prompt_end(self, mock_client_cls):
+        scheduler = KVPoolScheduler(make_config(), use_layerwise=False)
+        scheduler.use_exact_boundary_state = True
+        scheduler.cache_transfer_granularity = 32
+        scheduler.client = MagicMock(closed=False)
+        scheduler.client.lookup.return_value = 32
+        request = SimpleNamespace(
+            request_id="r1", num_tokens=64, prompt_token_ids=list(range(64)), block_hashes=["h0"] * 4
+        )
+        matched, asynchronous = scheduler.get_num_new_matched_tokens(request, 0)
+        self.assertEqual((matched, asynchronous), (32, False))
+        self.assertEqual(scheduler.client.lookup.call_args.args[0], 32)
+
+    def test_handoff_pins_exact_states_without_fabricating_rounded_boundaries(self):
+        scheduler = self._make_scheduler()
+        output = SimpleNamespace(
+            preempted_req_ids=set(),
+            kv_connector_block_state=SimpleNamespace(
+                boundary_state_offloads={"r1": [(1, 7, 32), (1, 7, 32), (2, 8, 48), (2, 9, 64), (1, 0, 64)]}
+            ),
+        )
+        requests = scheduler._prepare_boundary_state_saves(output)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].boundary_state_blocks, {1: [(7, 32)], 2: [(9, 64)]})
+        self.assertTrue(requests[0].boundary_state_only)
+        scheduler._block_pool.touch.assert_called_once_with([7, 9])
+        self.assertEqual(scheduler.sending_blocks, {0: [7, 9]})
+
+    def test_normal_job_refreshes_cow_tables_and_forbids_implicit_state_save(self):
+        scheduler = self._make_scheduler()
+        output = SimpleNamespace(
+            kv_connector_block_state=SimpleNamespace(get_block_ids=lambda req_id: ([1, 2], [0, 7], [0, 9]))
+        )
+        request = ReqMeta(req_id="r1", token_len_chunk=64, block_ids_by_group=[[99], [98], [97]])
+        scheduler._refresh_boundary_block_tables(request, output)
+        self.assertEqual(request.block_ids_by_group, [[1, 2], [0, 7], [0, 9]])
+        self.assertEqual(request.boundary_state_blocks, {})
+        scheduler.touch_sending_mamba_blocks(request)
+        scheduler._block_pool.touch.assert_not_called()
+        self.assertEqual(scheduler._request_trackers["r1"].allocated_block_ids_by_group, request.block_ids_by_group)
+
+
 if __name__ == "__main__":
     unittest.main()

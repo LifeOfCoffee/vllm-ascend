@@ -546,6 +546,49 @@ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
 
 
 class TestKVCacheStoreSendingThread(unittest.TestCase):
+    def test_exact_boundary_state_uses_offered_block_without_advancing_kv_watermark(self):
+        thread, store = self._make_thread()
+        thread.group_uses_align_state = [True]
+        # A retained state can arrive after ordinary KV advanced past it.
+        thread._saved_offsets["r1"] = 64
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=32,
+            block_ids=[],
+            block_hashes=["h0", "h1"],
+            boundary_state_blocks={0: [(7, 32)]},
+            boundary_state_only=True,
+            load_spec=LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=32, can_load=True),
+        )
+        thread.add_stored_request(request)
+        thread.request_queue.put(request)
+        thread._handle_request(request)
+        self.assertEqual(len(store.put_calls), 1)
+        keys, addrs, sizes = store.put_calls[0]
+        self.assertEqual([key.rsplit("@", 1)[1] for key in keys], ["h1"])
+        self.assertEqual(addrs, [[1007]])
+        self.assertEqual(sizes, [[16]])
+        self.assertEqual(thread.get_saved_offset("r1"), 64)
+
+    def test_exact_mode_never_infers_state_from_ordinary_block_table(self):
+        thread, store = self._make_thread()
+        thread.group_uses_align_state = [True]
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=32,
+            block_ids=[5, 6],
+            block_hashes=["h0", "h1"],
+            boundary_state_blocks={},
+        )
+        self.assertTrue(thread._handle_stored_request(request))
+        self.assertEqual(store.put_calls, [])
+
+    def test_exact_boundary_key_rejects_invented_or_uncommitted_boundary(self):
+        database = FakeTokenDatabase()
+        for entries in ([(0, 16)], [(5, 17)], [(5, 48)]):
+            with self.subTest(entries=entries), self.assertRaises(ValueError):
+                list(database.process_boundary_state_keys(["h0", "h1"], entries, 0))
+
     def _make_thread(
         self,
         exists_result=None,

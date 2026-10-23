@@ -1347,17 +1347,58 @@ class KVPoolWorker:
             size_list = []
             key_list = []
             block_id_list: list[int] = []
+            exact_boundary = request.boundary_state_blocks is not None
+            invalid_boundary = exact_boundary and any(
+                uses_align_state and group_id not in load_group_ids
+                for group_id, uses_align_state in enumerate(self.group_uses_align_state)
+            )
+            if invalid_boundary:
+                self._record_failed_request(request)
+                continue
             load_masks = self.token_database.load_mask(request.block_hashes, token_len)
             for group_id in load_group_ids:
                 if group_id >= len(request.block_ids_by_group):
+                    if exact_boundary and self.group_uses_align_state[group_id]:
+                        invalid_boundary = True
+                        break
                     continue
                 block_ids = request.block_ids_by_group[group_id]
                 group_block_size = self.grouped_block_size[group_id]
                 mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
                 skip_null = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
 
-                def chunk_filter(start: int, group_id=group_id, load_masks=load_masks) -> bool:
-                    return self.token_database.mask_allows_chunk(load_masks, group_id, start)
+                if exact_boundary and skip_null:
+                    state_index = token_len // group_block_size - 1
+                    if (
+                        token_len % group_block_size
+                        or not 0 <= state_index < len(block_ids)
+                        or block_ids[state_index] <= 0
+                    ):
+                        invalid_boundary = True
+                        break
+                    logger.debug(
+                        "QSA boundary state restore req=%s rank=%d group=%d boundary=%d block=%d",
+                        request.req_id,
+                        self.tp_rank,
+                        group_id,
+                        token_len,
+                        block_ids[state_index],
+                    )
+                    iterator = self.token_database.process_boundary_state_keys(
+                        request.block_hashes, [(block_ids[state_index], token_len)], group_id
+                    )
+                else:
+                    iterator = self.token_database.process_token_key_strings_with_block_ids(
+                        token_len,
+                        request.block_hashes,
+                        block_ids,
+                        mask_num,
+                        kv_cache_group_id=group_id,
+                        skip_null_blocks=skip_null,
+                        chunk_filter=lambda start,
+                        group_id=group_id,
+                        masks=load_masks: self.token_database.mask_allows_chunk(masks, group_id, start),
+                    )
 
                 for (
                     start,
@@ -1365,15 +1406,7 @@ class KVPoolWorker:
                     key,
                     _block_hash,
                     block_id,
-                ) in self.token_database.process_token_key_strings_with_block_ids(
-                    token_len,
-                    request.block_hashes,
-                    block_ids,
-                    mask_num,
-                    kv_cache_group_id=group_id,
-                    skip_null_blocks=skip_null,
-                    chunk_filter=chunk_filter,
-                ):
+                ) in iterator:
                     addr, size, block_id = self.token_database.prepare_value(
                         start,
                         end,
@@ -1385,6 +1418,9 @@ class KVPoolWorker:
                     addr_list.append(addr)
                     size_list.append(size)
                     block_id_list.append(block_id)
+            if invalid_boundary:
+                self._record_failed_request(request)
+                continue
             if not key_list:
                 continue
             key_list_c = _circular_shift(key_list, self.tp_rank % len(key_list))

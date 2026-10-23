@@ -674,6 +674,32 @@ class ChunkedTokenDatabase:
             assert block_id is not None
             yield start, end, prefix + block_hash_to_str(hash_val), hash_val, block_id
 
+    def process_boundary_state_keys(
+        self,
+        block_hashes: list[BlockHash],
+        boundaries: list[tuple[int, int]],
+        kv_cache_group_id: int,
+    ) -> Iterable[tuple[int, int, str, BlockHash | str, int]]:
+        """Select committed state blocks and reuse the normal group-key iterator."""
+        block_size = self.get_block_size(kv_cache_group_id)
+        seen: set[tuple[int, int]] = set()
+        for block_id, boundary in boundaries:
+            if block_id <= 0 or boundary <= 0 or boundary % block_size:
+                raise ValueError("Boundary state requires a non-null block at an exact group boundary")
+            if boundary > len(block_hashes) * self.hash_block_size:
+                raise ValueError("Boundary state has no committed prefix hash")
+            if (block_id, boundary) in seen:
+                continue
+            seen.add((block_id, boundary))
+            yield from self.process_token_key_strings_with_block_ids(
+                boundary,
+                block_hashes,
+                [block_id],
+                mask_num=boundary - block_size,
+                kv_cache_group_id=kv_cache_group_id,
+                skip_null_blocks=True,
+            )
+
     def decode_adaptor_prefill_pp(self, key, addr, size, kv_cache_group_id: int = 0, cache_role: str = "kv"):
         if self.partitions is None or len(self.partitions) == 1:
             return key, addr, size
@@ -1018,6 +1044,10 @@ class ReqMeta:
     # operation cannot update the save progress of a new request generation
     # that happens to reuse the same req_id.
     store_job_id: int | None = None
+    # None retains legacy state selection. An empty mapping forbids implicit
+    # align-state writes; entries carry (physical block id, exact boundary).
+    boundary_state_blocks: dict[int, list[tuple[int, int]]] | None = None
+    boundary_state_only: bool = False
 
     def __init__(
         self,
@@ -1059,6 +1089,8 @@ class ReqMeta:
         load_key_block_offset: int = 0,
         load_last_block_key: str | None = None,
         load_keys: list[str] | None = None,
+        boundary_state_blocks: dict[int, list[tuple[int, int]]] | None = None,
+        boundary_state_only: bool = False,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -1082,6 +1114,8 @@ class ReqMeta:
         self.original_block_size = original_block_size
         self.event_id = event_id
         self.store_job_id = store_job_id
+        self.boundary_state_blocks = boundary_state_blocks
+        self.boundary_state_only = boundary_state_only
         self.last_block_gva = last_block_gva
         self.partial_block_index = partial_block_index
         self.block_ids_np = block_ids_np

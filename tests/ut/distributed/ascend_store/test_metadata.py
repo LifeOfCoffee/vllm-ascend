@@ -186,6 +186,24 @@ class TestChunkedTokenDatabase(unittest.TestCase):
         self.db = ChunkedTokenDatabase([self.meta], block_size=[16], partitions=None)
         self.db.set_group_buffers({0: [1000, 2000]}, {0: [160, 320]}, group_num_layers={0: 1})
 
+    def test_boundary_state_keys_keep_exact_hashes_and_sparse_block_ids(self):
+        hashes = [f"h{i}" for i in range(16)]
+        for block_size in (16, 32, 64):
+            with self.subTest(block_size=block_size):
+                db = ChunkedTokenDatabase([self.meta], [block_size], None, hash_block_size=16)
+                result = list(
+                    db.process_boundary_state_keys(
+                        hashes, [(7, 3 * block_size), (2, block_size), (7, 3 * block_size)], 0
+                    )
+                )
+                self.assertEqual(
+                    [(start, end, key.rsplit("@", 1)[1], block) for start, end, key, _, block in result],
+                    [
+                        (2 * block_size, 3 * block_size, f"h{3 * block_size // 16 - 1}", 7),
+                        (0, block_size, f"h{block_size // 16 - 1}", 2),
+                    ],
+                )
+
     def test_make_key_by_hash(self):
         key = self.db._make_key_by_hash("abc")
         self.assertIsInstance(key, PoolKey)

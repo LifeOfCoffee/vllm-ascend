@@ -134,6 +134,12 @@ class KVPoolScheduler:
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
         self.cacheable_group_ids = infer_cacheable_group_ids(kv_cache_groups)
+        self.use_exact_boundary_state = bool(
+            self.num_speculative_blocks_by_group
+            and kv_cache_groups is not None
+            and any(name.endswith(".indexer.raw_key_cache") for group in kv_cache_groups for name in group.layer_names)
+            and not self.use_layerwise
+        )
         cacheable_block_sizes = [self.original_block_size[i] for i in self.cacheable_group_ids]
         if (
             self.use_layerwise
@@ -684,7 +690,12 @@ class KVPoolScheduler:
             token_len = prompt_token_len
             num_external_hit_tokens = self._get_layerwise_hit_tokens(request, token_len, num_computed_tokens)
         else:
-            if self._discard_partial_chunks:
+            if getattr(self, "use_exact_boundary_state", False):
+                # Leave a real forward tail and query the joint cache at the
+                # boundary we will actually restore. Flooring a later hit can
+                # select an earlier recurrent state that was never saved.
+                token_len = self._floor_to_cache_transfer_granularity(max(prompt_token_len - 1, 0))
+            elif self._discard_partial_chunks:
                 token_len = self._floor_to_cache_transfer_granularity(prompt_token_len)
             else:
                 token_len = prompt_token_len
@@ -1054,6 +1065,70 @@ class KVPoolScheduler:
             hash_block_size=self.hash_block_size,
         )
 
+    def _prepare_boundary_state_saves(self, scheduler_output: SchedulerOutput) -> list[ReqMeta]:
+        """Pin committed states before their sparse block tables change again."""
+        if not getattr(self, "use_exact_boundary_state", False) or not self.can_put:
+            return []
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+        if block_state is None:
+            raise RuntimeError("QSA pooling requires the scheduler boundary-state hand-off")
+        requests = []
+        for req_id, offers in block_state.boundary_state_offloads.items():
+            req_tuple = self._unfinished_requests.get(req_id)
+            if req_tuple is None or req_id in (scheduler_output.preempted_req_ids or ()):
+                continue
+            request = req_tuple[0]
+            if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
+                if not self.save_decode_cache or request.num_computed_tokens < len(request.prompt_token_ids):
+                    continue
+            by_group: dict[int, list[tuple[int, int]]] = {}
+            for group_id, block_id, boundary in offers:
+                if group_id not in self.num_speculative_blocks_by_group:
+                    continue
+                # Only whole transfer boundaries close the private raw-key
+                # compression group. Never round a state to an earlier hash.
+                if boundary <= 0 or boundary % self.cache_transfer_granularity or block_id <= 0:
+                    continue
+                if boundary // self.hash_block_size > len(request.block_hashes):
+                    continue
+                by_group.setdefault(group_id, []).append((block_id, boundary))
+            if not by_group:
+                continue
+            by_group = {group_id: sorted(set(entries)) for group_id, entries in by_group.items()}
+            boundary = max(end for entries in by_group.values() for _, end in entries)
+            req_meta = ReqMeta(
+                req_id=req_id,
+                save_end_token=boundary,
+                target_token_len=boundary,
+                block_ids_by_group=[[] for _ in self.kv_cache_group_ids],
+                block_hashes=list(request.block_hashes),
+                can_save=True,
+                num_prompt_tokens=len(request.prompt_token_ids),
+                kv_cache_group_ids=list(by_group),
+                boundary_state_blocks=by_group,
+                boundary_state_only=True,
+                token_ids=list(request.all_token_ids[:boundary]) if self.enable_kv_events else None,
+                original_block_size=self.original_block_size,
+            )
+            self.touch_sending_mamba_blocks(req_meta)
+            logger.debug("QSA boundary state hand-off req=%s states=%s event=%s", req_id, by_group, req_meta.event_id)
+            requests.append(req_meta)
+        return requests
+
+    def _refresh_boundary_block_tables(self, req_meta: ReqMeta, scheduler_output: SchedulerOutput) -> None:
+        if not getattr(self, "use_exact_boundary_state", False):
+            return
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+        block_ids = None if block_state is None else block_state.get_block_ids(req_meta.req_id)
+        if block_ids is None:
+            raise RuntimeError("QSA pooling requires authoritative current block tables")
+        current = [list(group) for group in block_ids]
+        req_meta.block_ids_by_group = current
+        req_meta.boundary_state_blocks = {}
+        tracker = self._request_trackers.get(req_meta.req_id)
+        if tracker is not None:
+            tracker.allocated_block_ids_by_group = [group.copy() for group in current]
+
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         """Attach the connector metadata to the request object.
 
@@ -1062,6 +1137,7 @@ class KVPoolScheduler:
         Also, calling this function will reset the state of the connector.
         """
         force_skip_save = self.kv_role == "kv_consumer" and not self.consumer_is_to_put
+        boundary_saves = self._prepare_boundary_state_saves(scheduler_output)
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
@@ -1088,6 +1164,7 @@ class KVPoolScheduler:
         for request in scheduler_output.scheduled_new_reqs:
             req_meta = self._process_new_request(request, scheduler_output, force_skip_save)
             if req_meta is not None:
+                self._refresh_boundary_block_tables(req_meta, scheduler_output)
                 self.touch_sending_mamba_blocks(req_meta)
                 meta.add_request(req_meta)
 
@@ -1103,6 +1180,7 @@ class KVPoolScheduler:
                     and not self.tp_mismatch
                     and not self.layerwise_offload
                     and not self.save_decode_cache
+                    and not getattr(self, "use_exact_boundary_state", False)
                 ):
                     continue
                 if req_id in self._preempted_req_ids:
@@ -1126,6 +1204,7 @@ class KVPoolScheduler:
                         force_skip_save,
                     )
                 if req_meta is not None:
+                    self._refresh_boundary_block_tables(req_meta, scheduler_output)
                     self.touch_sending_mamba_blocks(req_meta)
                     meta.add_request(req_meta)
 
@@ -1137,6 +1216,8 @@ class KVPoolScheduler:
                     self.touch_sending_mamba_blocks(req_meta)
                     meta.add_request(req_meta)
 
+        for req_meta in boundary_saves:
+            meta.add_request(req_meta)
         return meta
 
     def get_sending_event_id(self):
@@ -1159,19 +1240,26 @@ class KVPoolScheduler:
         # here would double-reference the block pool and leak blocks.
         if self.use_layerwise:
             return
+        current_step_sending: list[int] = []
+        if req_meta.boundary_state_blocks is not None:
+            current_step_sending = sorted(
+                {block_id for entries in req_meta.boundary_state_blocks.values() for block_id, _ in entries}
+            )
+            if not current_step_sending:
+                return
+        else:
+            for group_id, num_speculative_blocks in self.num_speculative_blocks_by_group.items():
+                group_block_ids = req_meta.block_ids_by_group[group_id]
+                # The last num_speculative_blocks slots are speculative scratch
+                # blocks that the allocator relocates in place; relocation requires
+                # them exclusively owned (ref_cnt == 1), so they must never be
+                # pinned here (crashes allocate_new_blocks after vllm PR #51358).
+                non_spec_block_ids = (
+                    group_block_ids[:-num_speculative_blocks] if num_speculative_blocks > 0 else group_block_ids
+                )
+                current_step_sending.extend([block_id for block_id in non_spec_block_ids if block_id > 0])
         using_event_id = self.get_sending_event_id()
         req_meta.event_id = using_event_id
-        current_step_sending: list[int] = []
-        for group_id, num_speculative_blocks in self.num_speculative_blocks_by_group.items():
-            group_block_ids = req_meta.block_ids_by_group[group_id]
-            # The last num_speculative_blocks slots are speculative scratch
-            # blocks that the allocator relocates in place; relocation requires
-            # them exclusively owned (ref_cnt == 1), so they must never be
-            # pinned here (crashes allocate_new_blocks after vllm PR #51358).
-            non_spec_block_ids = (
-                group_block_ids[:-num_speculative_blocks] if num_speculative_blocks > 0 else group_block_ids
-            )
-            current_step_sending.extend([block_id for block_id in non_spec_block_ids if block_id > 0])
         logger.debug("event: %s touch blocks: %s", using_event_id, current_step_sending)
         assert self._block_pool is not None
         self._block_pool.touch([self._block_pool.blocks[block_id] for block_id in current_step_sending])

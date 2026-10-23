@@ -1258,13 +1258,17 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return
             # Only explicit success may advance the saved offset; failures return False.
             succeeded = self._handle_stored_request(req_meta)
-            if succeeded is True:
+            if req_meta.boundary_state_only:
+                # Exact states have independent keys and no ordinary KV watermark.
+                pass
+            elif succeeded is True:
                 self.record_saved_offset(req_meta, req_meta.token_len_chunk)
                 self._clear_retry_token_ids(req_meta)
             else:
                 self._remember_retry_token_ids(req_meta)
         except Exception:
-            self._remember_retry_token_ids(req_meta)
+            if not req_meta.boundary_state_only:
+                self._remember_retry_token_ids(req_meta)
             logger.exception("Failed to store KV cache for request %s", req_id)
         finally:
             remaining = self.finish_store_job(req_meta) if tracked_request else None
@@ -1312,11 +1316,19 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         for group_id in req_meta.kv_cache_group_ids or [0]:
             group_block_size = self._get_block_size(group_id)
+            align_state_group = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
+            exact_states = req_meta.boundary_state_blocks
+            if align_state_group and exact_states is not None and not exact_states.get(group_id):
+                continue
 
             group_store_mask = (
                 store_masks[group_id] if store_masks is not None and group_id < len(store_masks) else None
             )
-            if group_store_mask is not None and not group_store_mask:
+            if (
+                not (align_state_group and exact_states is not None)
+                and group_store_mask is not None
+                and not group_store_mask
+            ):
                 continue
 
             starts: list[int] = []
@@ -1326,7 +1338,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
             key_block_ids: list[int] = []
             block_ids = req_meta.block_ids_by_group[group_id]
             skip_null_blocks = self._skip_null_blocks(req_meta, group_id)
-            align_state_group = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
             # Align-state slots below the saved extent can become valid later.
             save_start = 0 if align_state_group else save_start_token
 
@@ -1344,16 +1355,20 @@ class KVCacheStoreSendingThread(KVTransferThread):
             #  0        1 / 3            1      1, 5, ...
             #  1        0 / 2            2      2, 6, ...
             #  1        1 / 3            3      3, 7, ...
-            iterator = self.token_database.process_token_key_strings_with_block_ids(
-                token_len,
-                req_meta.block_hashes,
-                block_ids,
-                kv_cache_group_id=group_id,
-                skip_null_blocks=skip_null_blocks,
-                chunk_filter=chunk_filter,
-                shard_rank=self.pcp_rank * tp_replicas + self.tp_rank % tp_replicas,
-                shard_size=self.pcp_size * tp_replicas,
-                chunk_mask=group_store_mask,
+            iterator = (
+                self.token_database.process_boundary_state_keys(req_meta.block_hashes, exact_states[group_id], group_id)
+                if align_state_group and exact_states is not None
+                else self.token_database.process_token_key_strings_with_block_ids(
+                    token_len,
+                    req_meta.block_hashes,
+                    block_ids,
+                    kv_cache_group_id=group_id,
+                    skip_null_blocks=skip_null_blocks,
+                    chunk_filter=chunk_filter,
+                    shard_rank=self.pcp_rank * tp_replicas + self.tp_rank % tp_replicas,
+                    shard_size=self.pcp_size * tp_replicas,
+                    chunk_mask=group_store_mask,
+                )
             )
             for start, end, key, block_hash, block_id in iterator:
                 starts.append(start)

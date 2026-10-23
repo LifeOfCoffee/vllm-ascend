@@ -1136,10 +1136,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
 
     def test_register_kv_caches_non_mla(self):
         worker = self._make_worker()
-        fake_cache = MagicMock()
-        fake_cache.shape = [100, 16, 8, 64]
-        fake_cache.element_size.return_value = 2
-        fake_cache.data_ptr.return_value = 10000
+        fake_cache = torch.empty((100, 16, 8, 64), dtype=torch.bfloat16, device="cpu")
         kv_caches = {"layer.0": (fake_cache, fake_cache)}
         # init_store + register_buffer now happen directly in register_kv_caches
         # (no separate init_backend handshake). Mark threads as already started
@@ -1203,10 +1200,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
 
     def test_register_kv_caches_initializes_layerwise_memcache(self):
         worker = self._make_worker(extra_config={"backend": "memcache"}, use_layerwise=True)
-        fake_cache = MagicMock()
-        fake_cache.shape = [100, 16, 8, 64]
-        fake_cache.element_size.return_value = 2
-        fake_cache.data_ptr.return_value = 10000
+        fake_cache = torch.empty((100, 16, 8, 64), dtype=torch.bfloat16, device="cpu")
         worker._transfer_threads_started = True
 
         worker.register_kv_caches({"layer.0": (fake_cache, fake_cache)})
@@ -1235,6 +1229,65 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         stats = worker.get_stats()
         self.assertEqual(stats.data["load_get_keys"], 1)
         self.assertEqual(len(stats.data["load_get_duration_seconds"]), 1)
+
+    def test_exact_boundary_load_reads_terminal_state_into_authoritative_slot(self):
+        worker = self._make_worker(extra_config={"backend": "memcache", "load_async": False})
+        worker.group_uses_align_state = [True]
+        worker.token_database.set_group_buffers({0: [1000]}, {0: [16]}, {0: [32]})
+        worker.m_store.get.return_value = [0]
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=33,
+            block_ids=[0, 7],
+            block_hashes=["h0", "h1"],
+            boundary_state_blocks={},
+            load_spec=LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=32, can_load=True),
+        )
+        metadata = AscendConnectorMetadata(set())
+        metadata.add_request(request)
+        worker.start_load_kv(metadata)
+        keys, addresses, sizes = worker.m_store.get.call_args.args
+        self.assertEqual(len(keys), 1)
+        self.assertIn("h1", keys[0])
+        self.assertEqual(addresses, [[1224]])
+        self.assertEqual(sizes, [[16]])
+
+    def test_exact_boundary_load_rejects_missing_state_before_backend_get(self):
+        worker = self._make_worker(extra_config={"backend": "memcache", "load_async": False})
+        worker.group_uses_align_state = [True]
+        worker._record_failed_request = MagicMock()
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=33,
+            block_ids=[0, 0],
+            block_hashes=["h0", "h1"],
+            boundary_state_blocks={},
+            load_spec=LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=32, can_load=True),
+        )
+        metadata = AscendConnectorMetadata(set())
+        metadata.add_request(request)
+        worker.start_load_kv(metadata)
+        worker._record_failed_request.assert_called_once_with(request)
+        worker.m_store.get.assert_not_called()
+
+    def test_exact_boundary_load_rejects_omitted_state_group(self):
+        worker = self._make_worker(extra_config={"backend": "memcache", "load_async": False})
+        worker.group_uses_align_state = [False, True]
+        worker._record_failed_request = MagicMock()
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=33,
+            block_ids_by_group=[[7], [0, 8]],
+            block_hashes=["h0", "h1"],
+            kv_cache_group_ids=[0],
+            boundary_state_blocks={},
+            load_spec=LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=32, can_load=True),
+        )
+        metadata = AscendConnectorMetadata(set())
+        metadata.add_request(request)
+        worker.start_load_kv(metadata)
+        worker._record_failed_request.assert_called_once_with(request)
+        worker.m_store.get.assert_not_called()
 
     @patch(
         "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreRecvingThread.start",
@@ -2872,13 +2925,7 @@ class TestKVPoolWorkerTpMismatch(unittest.TestCase):
         worker = self._make_worker(
             tp_size=2, kv_role="kv_consumer", extra_config={"backend": "mooncake", "prefill_tp_size": 4}, num_kv_heads=8
         )
-        fake_cache = MagicMock()
-        fake_cache.shape = [100, 16, 4, 64]
-        fake_cache.__getitem__.return_value.numel.return_value = 16 * 4 * 64
-        fake_cache.element_size.return_value = 2
-        fake_cache.stride.return_value = 16 * 4 * 64
-        fake_cache.data_ptr.return_value = 10000
-        fake_cache.untyped_storage.return_value.data_ptr.return_value = 10000
+        fake_cache = torch.empty((100, 16, 4, 64), dtype=torch.bfloat16, device="cpu")
         worker._transfer_threads_started = True
 
         worker.register_kv_caches({"layers.0": (fake_cache, fake_cache)})

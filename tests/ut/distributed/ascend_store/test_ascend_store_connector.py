@@ -215,7 +215,9 @@ class TestAscendStoreConnector(unittest.TestCase):
                     "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.importlib.import_module"
                 ) as importer:
                     worker._init_backend(
-                        config.parallel_config, config.kv_transfer_config.kv_connector_extra_config, **kwargs
+                        config.parallel_config,
+                        config.kv_transfer_config.kv_connector_extra_config,
+                        **kwargs,
                     )
                     self.assertIs(importer.return_value.MemcacheBackend.call_args.kwargs["dp_init_barrier"], expected)
 
@@ -740,6 +742,73 @@ class TestAscendStoreConnectorLayerwise(unittest.TestCase):
 
             self.assertEqual(call_order, ["load", "copy:layers.0.linear_attn"])
             self.assertIsNone(connector._mamba_state)
+
+    def test_ple_and_attention_share_one_load_but_copy_each_owner(self):
+        connector = AscendStoreConnector.__new__(AscendStoreConnector)
+        connector.use_layerwise = True
+        connector._mamba_copy_bufs = None
+        connector._mamba_state = MagicMock()
+        connector._loaded_layer = None
+        connector.connector_worker = MagicMock()
+        worker = connector.connector_worker
+        worker._extract_physical_layer_index.side_effect = lambda name: int(name.split(".")[1])
+        order = []
+        worker.wait_for_layer_load.side_effect = lambda: order.append("load")
+        connector._mamba_state.do_mamba_copy_for_layer.side_effect = lambda name: order.append(name)
+        connector.wait_for_layer_load("layers.1.ple")
+        connector.wait_for_layer_load("layers.1.linear_attn")
+        self.assertEqual(order, ["load", "layers.1.ple", "layers.1.linear_attn"])
+        self.assertEqual(worker.wait_for_layer_load.call_count, 1)
+        connector.wait_for_layer_load("layers.2.linear_attn")
+        self.assertEqual(worker.wait_for_layer_load.call_count, 2)
+        connector.bind_connector_metadata(AscendConnectorMetadata(set()))
+        connector.wait_for_layer_load("layers.2.linear_attn")
+        self.assertEqual(worker.wait_for_layer_load.call_count, 3)
+
+    def test_unrecognized_layer_names_keep_original_wait_behavior(self):
+        for name in ("", "attention", "module2.attention", "layers.0suffix", "notlayers.0.attention"):
+            with self.subTest(layer_name=name):
+                connector = AscendStoreConnector.__new__(AscendStoreConnector)
+                connector.use_layerwise = True
+                connector._mamba_copy_bufs = None
+                connector._mamba_state = MagicMock()
+                connector._loaded_layer = 0
+                connector.connector_worker = MagicMock()
+                worker = connector.connector_worker
+                worker._extract_physical_layer_index.return_value = 0
+                connector.wait_for_layer_load(name)
+                connector.wait_for_layer_load(name)
+                self.assertEqual(worker.wait_for_layer_load.call_count, 2)
+                worker._extract_physical_layer_index.assert_not_called()
+                self.assertEqual(connector._mamba_state.do_mamba_copy_for_layer.call_count, 2)
+                self.assertIsNone(connector._loaded_layer)
+
+    def test_unknown_layer_clears_deduplication_between_known_layers(self):
+        connector = AscendStoreConnector.__new__(AscendStoreConnector)
+        connector.use_layerwise = True
+        connector._mamba_copy_bufs = None
+        connector._mamba_state = None
+        connector._loaded_layer = None
+        connector.connector_worker = MagicMock()
+        worker = connector.connector_worker
+        worker._extract_physical_layer_index.return_value = 0
+        for name in ("model.layers.0.ple", "model.layers.0.linear_attn", "attention", "model.layers.0.linear_attn"):
+            connector.wait_for_layer_load(name)
+        self.assertEqual(worker.wait_for_layer_load.call_count, 3)
+        self.assertEqual(connector._loaded_layer, 0)
+
+    def test_single_owner_layers_each_wait_once(self):
+        connector = AscendStoreConnector.__new__(AscendStoreConnector)
+        connector.use_layerwise = True
+        connector._mamba_copy_bufs = None
+        connector._mamba_state = None
+        connector._loaded_layer = None
+        connector.connector_worker = MagicMock()
+        worker = connector.connector_worker
+        worker._extract_physical_layer_index.side_effect = [0, 1, 2]
+        for layer in range(3):
+            connector.wait_for_layer_load(f"model.layers.{layer}.self_attn")
+        self.assertEqual(worker.wait_for_layer_load.call_count, 3)
 
     def test_mamba_state_copy_not_deferred_after_finish(self):
         from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole

@@ -1004,6 +1004,14 @@ def _uses_single_raw_mla_cache(
     return supports_strided_mla_cache(vllm_config, attn_module, kv_cache_spec)
 
 
+def _supports_six_region_cache_layout(vllm_config: VllmConfig) -> bool:
+    """Allow shared six-region views only with a compatible transfer path."""
+    transfer_config = vllm_config.kv_transfer_config
+    if transfer_config is None:
+        return True
+    return transfer_config.kv_connector == "AscendStoreConnector"
+
+
 def _allocate_kv_cache(
     kv_cache_config: KVCacheConfig,
     shared_layers: dict[str, str],
@@ -1056,7 +1064,9 @@ def _allocate_kv_cache(
     # slot_count contiguous slabs of slot_backing_size bytes; every
     # non-hidden owner views that one backing with role-specific region
     # offsets in _reshape_kv_cache_v2.
-    if vllm_config.kv_transfer_config is None and not is_dsv4_model:
+    # AscendStore transfers address each role view through its registered
+    # addresses and strides. Other connectors keep their existing path.
+    if not is_dsv4_model and _supports_six_region_cache_layout(vllm_config):
         six_region_layout = build_six_region_kv_cache_layout(
             kv_cache_config.kv_cache_groups,
             kv_cache_config.num_blocks,
@@ -1501,7 +1511,7 @@ def _reshape_kv_cache_v2(
     # view from the same deterministic layout that _allocate_kv_cache used:
     # slot_count contiguous slabs, each holding the six role regions.
     six_region_layout = None
-    if vllm_config.kv_transfer_config is None and not is_dsv4_model:
+    if not is_dsv4_model and _supports_six_region_cache_layout(vllm_config):
         six_region_layout = build_six_region_kv_cache_layout(
             kv_cache_config.kv_cache_groups,
             kv_cache_config.num_blocks,

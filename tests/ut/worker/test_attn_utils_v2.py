@@ -2997,3 +2997,21 @@ def test_combined_mla_cache_nonzero_offset_preserves_guards_and_slot_padding(dty
     assert k_cache.storage_offset() * k_cache.element_size() == raw_offset_bytes
     assert v_cache.storage_offset() * v_cache.element_size() == raw_offset_bytes + k_block_bytes
     assert k_cache.untyped_storage().data_ptr() == v_cache.untyped_storage().data_ptr() == backing.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "connector,extra,expected",
+    [
+        (None, {}, True),
+        ("AscendStoreConnector", {"backend": "memcache"}, True),
+        ("AscendStoreConnector", {"backend": "mooncake"}, True),
+        ("AscendStoreConnector", {"backend": "mooncake", "use_layerwise": True}, False),
+        ("AscendStoreConnector", {"backend": "mooncake", "load_async": True}, False),
+        ("MooncakeConnectorV1", {}, False),
+        ("MultiConnector", {}, False),
+    ],
+)
+def test_six_region_layout_connector_compatibility(connector, extra, expected):
+    transfer = None if connector is None else SimpleNamespace(kv_connector=connector, kv_connector_extra_config=extra)
+    config = SimpleNamespace(kv_transfer_config=transfer)
+    assert attn_utils._supports_six_region_cache_layout(config) is expected

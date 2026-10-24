@@ -684,7 +684,10 @@ class KVPoolScheduler:
             token_len = prompt_token_len
             num_external_hit_tokens = self._get_layerwise_hit_tokens(request, token_len, num_computed_tokens)
         else:
-            if self._discard_partial_chunks:
+            if len(self.cacheable_group_ids) != len(self.original_block_size):
+                # Query the exact restorable boundary before the joint lookup.
+                token_len = self._floor_to_cache_transfer_granularity(max(prompt_token_len - 1, 0))
+            elif self._discard_partial_chunks:
                 token_len = self._floor_to_cache_transfer_granularity(prompt_token_len)
             else:
                 token_len = prompt_token_len

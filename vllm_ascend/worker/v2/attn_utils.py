@@ -1105,6 +1105,12 @@ def allocate_shared_attention_kv_cache(
     }
 
 
+def _supports_six_region_cache_layout(vllm_config: VllmConfig) -> bool:
+    """Allow shared QSA/GDN views only with a compatible transfer path."""
+    transfer_config = vllm_config.kv_transfer_config
+    return transfer_config is None or getattr(transfer_config, "kv_connector", None) == "AscendStoreConnector"
+
+
 def _allocate_kv_cache(
     kv_cache_config: KVCacheConfig,
     shared_layers: dict[str, str],
@@ -1168,7 +1174,7 @@ def _allocate_kv_cache(
     # build the layout from the cache groups themselves. Allocate
     # slot_count shared slabs plus one dense bank per PLE/hidden owner.
     # Reshape must preserve the physical byte strides used by this planner.
-    if vllm_config.kv_transfer_config is None and not is_dsv4_model:
+    if not is_dsv4_model and _supports_six_region_cache_layout(vllm_config):
         six_region_layout = build_qwen4_kv_cache_layout(
             kv_cache_config.kv_cache_groups,
             kv_cache_config.num_blocks,
@@ -1651,7 +1657,7 @@ def _reshape_kv_cache_v2(
     # view from the same deterministic layout that _allocate_kv_cache used:
     # slot_count contiguous slabs, each holding the six role regions.
     six_region_layout = None
-    if vllm_config.kv_transfer_config is None and not is_dsv4_model:
+    if not is_dsv4_model and _supports_six_region_cache_layout(vllm_config):
         six_region_layout = build_qwen4_kv_cache_layout(
             kv_cache_config.kv_cache_groups,
             kv_cache_config.num_blocks,

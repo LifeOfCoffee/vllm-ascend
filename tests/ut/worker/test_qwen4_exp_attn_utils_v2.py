@@ -47,10 +47,13 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
-from vllm_ascend.core.six_region_kv_cache_layout import (
+from vllm_ascend.models.qwen4_exp.cache_config import (
     HIDDEN,
+    PLE,
     QSA_RAW,
-    build_six_region_kv_cache_layout,
+)
+from vllm_ascend.models.qwen4_exp.cache_config import (
+    build_qwen4_kv_cache_layout as build_six_region_kv_cache_layout,
 )
 from vllm_ascend.models.qwen4_exp.qsa import AscendQSABackend
 from vllm_ascend.worker.v2 import attn_utils
@@ -180,8 +183,8 @@ def test_six_region_allocation_maps_owners_to_one_backing():
 
     raw = attn_utils._allocate_kv_cache(kv_cache_config, shared_layers={}, device=torch.device("cpu"))
 
-    non_hidden = [owner for owner in layout.owners if owner.role != HIDDEN]
-    hidden = [owner for owner in layout.owners if owner.role == HIDDEN]
+    non_hidden = [owner for owner in layout.owners if owner.role not in (HIDDEN, PLE)]
+    hidden = [owner for owner in layout.owners if owner.role in (HIDDEN, PLE)]
     assert non_hidden and hidden
     backing = raw[non_hidden[0].layer_name]
     assert isinstance(backing, torch.Tensor)
@@ -189,7 +192,9 @@ def test_six_region_allocation_maps_owners_to_one_backing():
     for owner in non_hidden:
         assert raw[owner.layer_name] is backing
     for owner in hidden:
-        assert owner.layer_name not in raw
+        assert raw[owner.layer_name] is not backing
+        page_bytes = owner.spec.state_content_size_bytes if owner.role == PLE else owner.spec.page_size_bytes
+        assert raw[owner.layer_name].numel() == num_blocks * page_bytes
     assert backing.numel() == layout.slot_count * layout.slot_backing_size
 
 
@@ -216,23 +221,27 @@ def test_six_region_reshape_builds_role_views():
     assert k_cache.shape == (num_blocks, 256, 1, 64)
     assert v_cache.shape == (num_blocks, 256, 1, 64)
     assert k_cache.dtype == v_cache.dtype == torch.bfloat16
-    assert k_cache.is_contiguous() and v_cache.is_contiguous()
+    assert k_cache[0].is_contiguous() and v_cache[0].is_contiguous()
+    assert k_cache.stride(0) * k_cache.element_size() == layout.region("r0").block_stride
+    assert v_cache.stride(0) == k_cache.stride(0)
     # Both views address the same contiguous backing at disjoint offsets.
     assert k_cache.untyped_storage().data_ptr() == backing.untyped_storage().data_ptr()
     assert v_cache.untyped_storage().data_ptr() == backing.untyped_storage().data_ptr()
     slot = layout.owner(MAIN_LAYER).slot
-    assert k_cache.storage_offset() == (slot * layout.slot_backing_size + layout.region("r2").offset) // 2
-    assert v_cache.storage_offset() == (slot * layout.slot_backing_size + layout.region("r3").offset) // 2
+    assert k_cache.storage_offset() == (slot * layout.slot_backing_size + layout.region("r0").offset) // 2
+    assert (
+        v_cache.storage_offset() == (slot * layout.slot_backing_size + layout.region("r0").offset + 256 * 64 * 2) // 2
+    )
 
     raw_cache = kv_caches[RAW_LAYER]
     assert isinstance(raw_cache, torch.Tensor)
-    assert raw_cache.shape == (num_blocks, 1, 8, 32)
+    assert raw_cache.shape == (num_blocks, 8, 1, 32)
     assert raw_cache.dtype == torch.bfloat16
 
     compressed_cache = kv_caches[COMPRESSED_LAYER]
     assert isinstance(compressed_cache, torch.Tensor)
     # The compressed cache stores block_size/ratio states per page.
-    assert compressed_cache.shape == (num_blocks, 1, 64, 32)
+    assert compressed_cache.shape == (num_blocks, 64, 1, 32)
 
     gdn_caches = kv_caches[GDN_LAYERS[0]]
     assert isinstance(gdn_caches, list)
@@ -257,7 +266,7 @@ def test_six_region_reshape_rejects_page_mismatch(monkeypatch):
         owner=lambda _layer_name: SimpleNamespace(slot=0, role=QSA_RAW),
         region=lambda _name: SimpleNamespace(offset=0, page_size_bytes=3),
     )
-    monkeypatch.setattr(attn_utils, "build_six_region_kv_cache_layout", lambda *_args: tampered)
+    monkeypatch.setattr(attn_utils, "build_qwen4_kv_cache_layout", lambda *_args: tampered)
 
     with pytest.raises(ValueError, match="six-region page mismatch"):
         attn_utils._reshape_kv_cache_v2(

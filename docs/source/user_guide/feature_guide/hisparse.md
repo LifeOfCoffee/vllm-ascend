@@ -60,9 +60,9 @@ For native A5 C8, replace the two dtype options with:
 ### P/D with a Memcache Prefill pool
 
 Run a Prefill instance without HiSparse and a Decode instance with HiSparse.
-Configure both instances with the existing Mooncake transfer service. The
-Prefill connector saves ordinary KV to Memcache; the Decode connector pulls
-the Prefill KV directly. The Decode instance does not read Memcache.
+Use the layerwise P/D proxy with Decode allocation before Prefill. The
+Prefill connector saves ordinary KV to Memcache and pushes the Prefill KV
+directly to Decode. The Decode instance does not read Memcache.
 
 Prefill `--kv-transfer-config`:
 
@@ -76,11 +76,14 @@ Decode `--kv-transfer-config`:
 {"kv_connector":"MultiConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"connectors":[{"kv_connector":"HiSparseConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"host_pool_gib":4}},{"kv_connector":"HiSparsePDConnector","kv_role":"kv_consumer"}]}}
 ```
 
-Set distinct Mooncake `kv_port` values for the P and D connectors and follow
-the [Mooncake P/D setup](../../tutorials/features/pd_disaggregation_mooncake_single_node.md)
-for its transfer service. Both instances must use the same model and KV format.
-The D connector imports main KV into Host Source, writes Indexer KV to the NPU,
-and notifies Core after transfer; Core restores the last page to Resident.
+Set distinct Mooncake `kv_port` values for P and D. Use the
+[layerwise Push proxy](../../developer_guide/Design_Documents/disaggregated_prefill.md)
+so D publishes its allocation before P starts Prefill. This path requires
+matching TP sizes, DCP=1, and no KVPP. Both instances must use the same model
+and KV format. P writes MLA main KV into D's pinned Host staging and Indexer
+KV directly into D NPU. After all P workers report completion, D copies the
+imported Host pages into Source and notifies Core; Core restores the last page
+to Resident. Account for the additional pinned Host staging capacity on D.
 
 ### Verifying the Feature
 

@@ -29,7 +29,7 @@ supported, with independent Main and Indexer KV dtype selection.
 | --- | --- |
 | Hardware and software | Ascend 950 with a SIMT-capable CANN 9.2 toolchain. |
 | Cache formats | C4, TurboQuant and INT8-format C8 are outside the current support scope. |
-| Parallelism and transport | Context parallelism is unsupported. For P/D transport, use `HiSparsePDConnector` with Ascend Mooncake/HIXL and matching TP sizes. |
+| Parallelism and transport | Context parallelism is unsupported. For P/D transport, use `HiSparsePDConnector` with a Mooncake TransferEngine build supporting Ascend and matching TP sizes. The selected Ascend transport backend depends on the Mooncake build and runtime configuration. |
 | Host storage | Use private Host pools per tensor-parallel rank and Core eager Host mirroring. |
 | P/D Host import | The D worker registers a separate pinned Host staging region for Mooncake, with capacity equal to the Host Source pool. Allow for this additional Host memory per TP rank. |
 | TopK | The existing SFA requirement of divisibility by 128 applies. |

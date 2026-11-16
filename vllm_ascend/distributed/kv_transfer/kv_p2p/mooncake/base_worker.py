@@ -364,10 +364,7 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
         self.handshake_port = self.side_channel_port + device_index
 
         device_name = str(torch.npu.current_device()) if self.pp_size > 1 else None
-        self.engine = global_te.get_transfer_engine(
-            self.side_channel_host,
-            device_name=device_name,
-        )
+        self.engine = self._get_transfer_engine(device_name)
         self.te_rpc_port = self.engine.get_rpc_port()
         self.xfer_handshake_metadata: KVConnectorHandshakeMetadata | None = None
         self.xfer_stats = MooncakeKVConnectorStats()
@@ -376,6 +373,12 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
 
     def _is_transfer_group(self, group_index: int) -> bool:
         return True
+
+    def _get_transfer_engine(self, device_name: str | None):
+        return global_te.get_transfer_engine(self.side_channel_host, device_name=device_name)
+
+    def _register_transfer_buffers(self, ptrs: list[int], lengths: list[int]) -> None:
+        global_te.register_buffer(ptrs, lengths)
 
     def _logical_num_blocks(self, group_index: int) -> int:
         return self.num_blocks
@@ -632,7 +635,7 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
             self.kv_cache_config, kv_caches, included_layer_names=transfer_layer_names
         )
         validate_register_region_count(register_regions)
-        global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+        self._register_transfer_buffers(register_regions.ptrs, register_regions.lengths)
 
         transfer_metadata = MooncakeTransferMetadata(
             engine_id=self.engine_id,

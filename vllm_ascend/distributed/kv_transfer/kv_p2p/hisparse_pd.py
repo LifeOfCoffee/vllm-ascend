@@ -1,29 +1,134 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Push P KV into HiSparse's Host Source and NPU Indexer groups."""
+"""Pull P KV into HiSparse's Host Source and NPU Indexer groups."""
 
-import ctypes
-import math
 from typing import Any
 
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
-from vllm.logger import logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.connector import MooncakeBaseConnector, MooncakePushConnector
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import MooncakeConnectorMetadata
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.push_scheduler import MooncakePushConnectorScheduler
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.push_worker import MooncakePushConnectorWorker
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import as_kv_cache_tensors
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.connector import MooncakeBaseConnector, MooncakePullConnector
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_scheduler import MooncakePullConnectorScheduler
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import (
+    MooncakePullConnectorWorker,
+    MooncakePullRecvingThread,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
+    as_kv_cache_tensors,
+)
+from vllm_ascend.distributed.kv_transfer.utils.memfabric_transfer_engine import global_memfabric_te
 
-_HOST_ALIGNMENT = 2 * 1024 * 1024
+
+class _HiSparsePullThread(MooncakePullRecvingThread):
+    def _append_spec_transfer_addresses(
+        self,
+        spec_index,
+        remote_pcp_rank,
+        remote_tp_rank,
+        remote_pcp_size,
+        remote_tp_size,
+        remote_dcp_size,
+        transfer_entries_by_layer,
+        remote_metadata,
+        src_list,
+        dst_list,
+        length_list,
+    ):
+        if remote_tp_size != self.tp_size or remote_pcp_size != 1 or remote_dcp_size != 1:
+            raise ValueError("HiSparse Pull requires equal P/D TP and PCP=DCP=1")
+        host_layers = {
+            pair: entries
+            for pair, entries in transfer_entries_by_layer.items()
+            if self.kv_cache_config.kv_cache_groups[self.group_indices[pair[0]]].host_resident
+        }
+        ordinary = {pair: entries for pair, entries in transfer_entries_by_layer.items() if pair not in host_layers}
+        if ordinary:
+            super()._append_spec_transfer_addresses(
+                spec_index,
+                remote_pcp_rank,
+                remote_tp_rank,
+                remote_pcp_size,
+                remote_tp_size,
+                remote_dcp_size,
+                ordinary,
+                remote_metadata,
+                src_list,
+                dst_list,
+                length_list,
+            )
+        peer = remote_metadata.metadata_by_pcp_rank[remote_pcp_rank].metadata_by_tp_rank[remote_tp_rank]
+        for (local_index, remote_index), entries in host_layers.items():
+            targets = self.kv_caches_base_addr[local_index]
+            sources = peer.kv_caches_base_addr[remote_index]
+            if len(targets) != 1 or len(sources) not in (1, 2):
+                raise ValueError("HiSparse Pull requires one Host Source and one or two P components")
+            tokens = self.kv_cache_specs[spec_index].block_size
+            component_bytes = remote_metadata.block_lens[remote_index]
+            source_strides = remote_metadata.block_strides[remote_index]
+            if len(sources) == 1 and len(remote_metadata.block_shapes[remote_index][0]) == 1:
+                # The common worker publishes component-major MLA slots as one flat descriptor.
+                hf = self.model_config.hf_text_config
+                itemsize = self.kv_cache_specs[spec_index].dtype.itemsize
+                latent_bytes = tokens * hf.kv_lora_rank * itemsize
+                rope_bytes = tokens * hf.qk_rope_head_dim * itemsize
+                if latent_bytes + rope_bytes > component_bytes[0]:
+                    raise ValueError("P MLA slot is smaller than its NoPE/RoPE payload")
+                sources = [sources[0], sources[0] + latent_bytes]
+                component_bytes = [latent_bytes, rope_bytes]
+                source_strides = [source_strides[0], source_strides[0]]
+            page_bytes = self.block_lens[local_index][0]
+            if sum(component_bytes) != page_bytes or any(size % tokens for size in component_bytes):
+                raise ValueError("HiSparse Pull MLA component sizes differ from Host Source")
+            row_bytes = [size // tokens for size in component_bytes]
+            for _, local_blocks, remote_blocks in entries:
+                for local_block, remote_block in zip(local_blocks, remote_blocks, strict=True):
+                    target = targets[0] + local_block * self.block_strides[local_index][0]
+                    for token in range(tokens):
+                        offset = 0
+                        for component, size in enumerate(row_bytes):
+                            # READ takes local destinations first, then remote P sources.
+                            src_list.append(target + token * sum(row_bytes) + offset)
+                            dst_list.append(
+                                sources[component] + remote_block * source_strides[component] + token * size
+                            )
+                            length_list.append(size)
+                            offset += size
 
 
-class _HiSparsePDWorker(MooncakePushConnectorWorker):
+class _HiSparsePDWorker(MooncakePullConnectorWorker):
+    receiving_thread_cls = _HiSparsePullThread
+
+    def _get_transfer_engine(self, device_name: str | None):
+        extra = self.kv_transfer_config.kv_connector_extra_config or {}
+        global_memfabric_te.configure(
+            role="Decode" if self.kv_transfer_config.is_kv_consumer else "Prefill",
+            device_id=torch.npu.current_device(),
+            transfer_protocol=extra.get("memfabric_transfer_protocol", "device_urma"),
+        )
+        return global_memfabric_te.get_transfer_engine(self.side_channel_host)
+
+    def _register_transfer_buffers(self, ptrs: list[int], lengths: list[int]) -> None:
+        # URMA is communication-based: both P sources and D Host/Indexer destinations need MRs.
+        regions: dict[int, int] = {}
+        for ptr, length in zip(ptrs, lengths, strict=True):
+            for base, size in getattr(self, "_host_pool_regions", {}).items():
+                if base <= ptr < base + size:
+                    if ptr + length > base + size:
+                        raise ValueError("HiSparse transfer region exceeds its Host pool")
+                    # The SDK reuses an Offload mapping only for an identical full range.
+                    ptr, length = base, size
+                    break
+            regions[ptr] = max(regions.get(ptr, 0), length)
+        global_memfabric_te.register_buffer(list(regions), list(regions.values()))
+
     def _is_transfer_group(self, group_index: int) -> bool:
-        return self.kv_cache_config.kv_cache_groups[group_index].enable_kv_transfer
+        group = self.kv_cache_config.kv_cache_groups[group_index]
+        if getattr(self.kv_cache_config, "hisparse_shared_host_pool", False) and group.host_resident:
+            # MLA Host KV is replicated across TP; rank 0 imports the shared copy once.
+            return group.enable_kv_transfer and self.tp_rank == 0
+        return group.enable_kv_transfer
 
     def _logical_num_blocks(self, group_index: int) -> int:
         group = self.kv_cache_config.kv_cache_groups[group_index]
@@ -45,36 +150,9 @@ class _HiSparsePDWorker(MooncakePushConnectorWorker):
             source_parts = [cache for name in source_names for cache in as_kv_cache_tensors(kv_caches[name])]
             if not source_parts or any(cache.device.type != "cpu" for cache in source_parts):
                 raise ValueError("HiSparse PD Source must consist of Host tensors")
-            source_start = min(cache.data_ptr() for cache in source_parts)
-            source_end = max(
-                cache.data_ptr()
-                + cache.element_size()
-                + sum((size - 1) * stride * cache.element_size() for size, stride in zip(cache.shape, cache.stride()))
-                for cache in source_parts
-            )
-            host_blocks = self.kv_cache_config.hisparse_host_num_blocks
-            host_stride = self.kv_cache_config.hisparse_host_block_stride
-            assert host_blocks is not None and host_stride is not None
-            staging_size = (
-                (max(source_end - source_start, host_blocks * host_stride) + _HOST_ALIGNMENT - 1) // _HOST_ALIGNMENT
-            ) * _HOST_ALIGNMENT
-            owner = torch.empty(staging_size + _HOST_ALIGNMENT - 1, dtype=torch.uint8, pin_memory=True)
-            alignment_offset = (-owner.data_ptr()) % _HOST_ALIGNMENT
-            staging = owner.narrow(0, alignment_offset, staging_size)
-            self._source_staging_owner = owner
-            self._host_stage_range = (staging.data_ptr(), staging.data_ptr() + staging_size, source_start, source_end)
-            for name in source_names:
-                staged_parts = []
-                for cache in as_kv_cache_tensors(kv_caches[name]):
-                    offset = alignment_offset + cache.data_ptr() - source_start
-                    if offset % cache.element_size():
-                        raise ValueError(f"Misaligned HiSparse Source layer {name!r}")
-                    staged_parts.append(
-                        staging.view(cache.dtype).as_strided(
-                            cache.shape, cache.stride(), storage_offset=offset // cache.element_size()
-                        )
-                    )
-                caches[name] = tuple(staged_parts)
+            self._host_pool_regions = {
+                cache.untyped_storage().data_ptr(): cache.untyped_storage().nbytes() for cache in source_parts
+            }
             for group in self.kv_cache_config.kv_cache_groups:
                 if group.role != "hisparse_indexer":
                     continue
@@ -85,86 +163,9 @@ class _HiSparsePDWorker(MooncakePushConnectorWorker):
             kv_caches = caches
         super().register_kv_caches(kv_caches)
 
-    def _append_packed_mla_addresses(
-        self, batch, local_index, remote_index, local, pp, worker, src_list, dst_list, length_list
-    ) -> bool:
-        source_addrs = local.kv_caches_base_addr[local_index]
-        target_addrs = worker.kv_caches_base_addr[remote_index]
-        if len(source_addrs) != 2 or len(target_addrs) != 1:
-            return False
-        tokens = self.kv_cache_specs[self.layer_name_to_spec_index[batch.layer_name]].block_size
-        component_bytes = local.block_lens[local_index]
-        target_bytes = pp.block_lens[remote_index][0]
-        if any(size % tokens for size in component_bytes) or sum(component_bytes) != target_bytes:
-            raise ValueError("HiSparse PD MLA component sizes differ from Host Source")
-        row_bytes = [size // tokens for size in component_bytes]
-        for request in batch.requests:
-            for source_block, target_block in zip(request.local_block_ids, request.remote_block_ids, strict=True):
-                source_pages = [
-                    addr + source_block * local.block_strides[local_index][component]
-                    for component, addr in enumerate(source_addrs)
-                ]
-                target_page = target_addrs[0] + target_block * pp.block_strides[remote_index][0]
-                for token in range(tokens):
-                    for component in range(2):
-                        src_list.append(source_pages[component] + token * row_bytes[component])
-                        dst_list.append(target_page + token * sum(row_bytes) + (row_bytes[0] if component else 0))
-                        length_list.append(row_bytes[component])
-        return True
 
-    def start_load_kv(self, metadata: MooncakeConnectorMetadata) -> None:
-        if self.kv_transfer_config.is_kv_consumer:
-            self._source_imports = getattr(self, "_source_imports", {})
-            self._source_imports.update((req.request_id, req) for req in metadata.push_requests.values())
-        super().start_load_kv(metadata)
-
-    def get_transfer_results(self):
-        results = super().get_transfer_results()
-        if not self.kv_transfer_config.is_kv_consumer:
-            return results
-        for request_id in results.finished_recving:
-            request = self._source_imports.pop(request_id, None)
-            if request_id in results.failed_recving:
-                continue
-            if request is None:
-                logger.error("HiSparse PD missing Host Source import metadata for %s", request_id)
-                results.failed_recving.add(request_id)
-                continue
-            try:
-                self._copy_imported_source(request)
-            except Exception:
-                logger.exception("HiSparse PD failed to import Host Source for %s", request_id)
-                results.failed_recving.add(request_id)
-        return results
-
-    def _copy_imported_source(self, request) -> None:
-        stage_start, stage_end, source_start, source_end = self._host_stage_range
-        for layer_index, name in enumerate(self.transfer_metadata.layer_names):
-            group_index = self.transfer_metadata.group_indices[layer_index]
-            group = self.kv_cache_config.kv_cache_groups[group_index]
-            if not group.host_resident:
-                continue
-            if self.transfer_metadata.block_size_scales[layer_index][0] != 1:
-                raise ValueError("HiSparse PD Host Source must have one physical page per block")
-            blocks = request.local_block_ids[group_index]
-            block_size = group.kv_cache_spec.block_size
-            first = request.num_computed_tokens // block_size
-            last = math.ceil((request.num_computed_tokens + request.num_external_tokens) / block_size)
-            if last > len(blocks):
-                raise ValueError("HiSparse PD Host Source block table is shorter than the import")
-            base = self.transfer_metadata.kv_caches_base_addr[layer_index][0]
-            stride = self.transfer_metadata.block_strides[layer_index][0]
-            length = self.transfer_metadata.block_lens[layer_index][0]
-            for block in blocks[first:last]:
-                page = base + block * stride
-                target = source_start + page - stage_start
-                if block == 0 or page < stage_start or page + length > stage_end or target + length > source_end:
-                    raise ValueError(f"HiSparse PD Host Source page out of range for {name}")
-                ctypes.memmove(target, page, length)
-
-
-class HiSparsePDConnector(MooncakePushConnector):
-    """Use Ascend Mooncake transport with Core HiSparse import ownership."""
+class HiSparsePDConnector(MooncakePullConnector):
+    """Use MemFabric READ with Core HiSparse import ownership."""
 
     def __init__(
         self,
@@ -187,7 +188,7 @@ class HiSparsePDConnector(MooncakePushConnector):
             raise ValueError("HiSparsePDConnector producer must use ordinary Prefill KV")
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = MooncakePushConnectorScheduler(vllm_config, str(self.engine_id), kv_cache_config)
+            self.connector_scheduler = MooncakePullConnectorScheduler(vllm_config, str(self.engine_id), kv_cache_config)
         elif role == KVConnectorRole.WORKER:
             self.connector_worker = _HiSparsePDWorker(vllm_config, str(self.engine_id), kv_cache_config)
         else:

@@ -5,12 +5,8 @@
 from typing import Any
 
 import torch
-from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.connector import MooncakeBaseConnector, MooncakePullConnector
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_scheduler import MooncakePullConnectorScheduler
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import (
     MooncakePullConnectorWorker,
     MooncakePullRecvingThread,
@@ -18,7 +14,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     as_kv_cache_tensors,
 )
-from vllm_ascend.distributed.kv_transfer.utils.memfabric_transfer_engine import global_memfabric_te
+from vllm_ascend.distributed.kv_transfer.utils.hisparse_mooncake_te import global_hisparse_te
 
 
 class _HiSparsePullThread(MooncakePullRecvingThread):
@@ -102,12 +98,9 @@ class _HiSparsePDWorker(MooncakePullConnectorWorker):
 
     def _get_transfer_engine(self, device_name: str | None):
         extra = self.kv_transfer_config.kv_connector_extra_config or {}
-        global_memfabric_te.configure(
-            role="Decode" if self.kv_transfer_config.is_kv_consumer else "Prefill",
-            device_id=torch.npu.current_device(),
-            transfer_protocol=extra.get("memfabric_transfer_protocol", "device_urma"),
-        )
-        return global_memfabric_te.get_transfer_engine(self.side_channel_host)
+        if extra.get("memfabric_transfer_protocol", "device_urma") != "device_urma":
+            raise ValueError("HiSparse Mooncake PD supports only device_urma; SDMA is disabled")
+        return global_hisparse_te.get_transfer_engine(self.side_channel_host, device_name)
 
     def _register_transfer_buffers(self, ptrs: list[int], lengths: list[int]) -> None:
         # URMA is communication-based: both P sources and D Host/Indexer destinations need MRs.
@@ -121,7 +114,7 @@ class _HiSparsePDWorker(MooncakePullConnectorWorker):
                     ptr, length = base, size
                     break
             regions[ptr] = max(regions.get(ptr, 0), length)
-        global_memfabric_te.register_buffer(list(regions), list(regions.values()))
+        global_hisparse_te.register_buffer(list(regions), list(regions.values()))
 
     def _is_transfer_group(self, group_index: int) -> bool:
         group = self.kv_cache_config.kv_cache_groups[group_index]
@@ -164,32 +157,13 @@ class _HiSparsePDWorker(MooncakePullConnectorWorker):
         super().register_kv_caches(kv_caches)
 
 
-class HiSparsePDConnector(MooncakePullConnector):
-    """Use MemFabric READ with Core HiSparse import ownership."""
-
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        role: KVConnectorRole,
-        kv_cache_config: KVCacheConfig,
-    ) -> None:
-        MooncakeBaseConnector.__init__(self, vllm_config, role, kv_cache_config)
-        if self.kv_transfer_config.is_kv_consumer:
-            if kv_cache_config.hisparse_host_num_blocks is None:
-                raise ValueError("HiSparsePDConnector consumer requires HiSparse Host Source")
-            transferable = [group for group in kv_cache_config.kv_cache_groups if group.enable_kv_transfer]
-            if (
-                len(transferable) != 2
-                or not transferable[0].host_resident
-                or transferable[1].role != "hisparse_indexer"
-            ):
-                raise ValueError("HiSparsePDConnector requires Host Source and NPU Indexer transfer groups")
-        elif kv_cache_config.hisparse_host_num_blocks is not None:
-            raise ValueError("HiSparsePDConnector producer must use ordinary Prefill KV")
-
-        if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = MooncakePullConnectorScheduler(vllm_config, str(self.engine_id), kv_cache_config)
-        elif role == KVConnectorRole.WORKER:
-            self.connector_worker = _HiSparsePDWorker(vllm_config, str(self.engine_id), kv_cache_config)
-        else:
-            raise ValueError(f"Unsupported KVConnectorRole: {role}")
+def validate_hisparse_pd_config(transfer, kv_cache_config: KVCacheConfig) -> None:
+    """Validate the ordinary P -> HiSparse D layout before starting either role."""
+    if transfer.is_kv_consumer:
+        if kv_cache_config.hisparse_host_num_blocks is None:
+            raise ValueError("Mooncake memfabric consumer requires HiSparse Host Source")
+        transferable = [group for group in kv_cache_config.kv_cache_groups if group.enable_kv_transfer]
+        if len(transferable) != 2 or not transferable[0].host_resident or transferable[1].role != "hisparse_indexer":
+            raise ValueError("Mooncake memfabric requires Host Source and NPU Indexer transfer groups")
+    elif kv_cache_config.hisparse_host_num_blocks is not None:
+        raise ValueError("Mooncake memfabric producer must use ordinary Prefill KV")

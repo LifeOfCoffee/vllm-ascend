@@ -27,11 +27,15 @@ def uses_memfabric(vllm_config) -> bool:
     transfer = vllm_config.kv_transfer_config if vllm_config else None
     if transfer is None:
         return False
-    if transfer.kv_connector == "HiSparsePDConnector":
-        return True
-    return transfer.kv_connector == "MultiConnector" and any(
-        child.get("kv_connector") == "HiSparsePDConnector"
-        for child in (transfer.kv_connector_extra_config or {}).get("connectors", [])
+    connectors = (
+        (transfer.kv_connector_extra_config or {}).get("connectors", [])
+        if transfer.kv_connector == "MultiConnector"
+        else [{"kv_connector": transfer.kv_connector, "kv_connector_extra_config": transfer.kv_connector_extra_config}]
+    )
+    return any(
+        child.get("kv_connector") in ("MooncakeConnectorV2", "MooncakePullConnector")
+        and (child.get("kv_connector_extra_config") or {}).get("mooncake_transport") == "memfabric"
+        for child in connectors
     )
 
 
@@ -60,8 +64,9 @@ class MemFabricSharedHostRegion:
         config.world_size = group.world_size
         config.rank_id = group.rank_in_group
         config.scene = offload.Scene.SHARED
+        config.flags = offload.OFFLOAD_FLAG_GIANT_PAGE
         config.store_url = f"tcp://127.0.0.1:{port}"
-        # SHARED uses the SDK's unified-address mapping, not LOCAL GIANT_PAGE.
+        # The SDK owns both the shared storage and its per-device mappings.
         if offload.initialize(config) != 0:
             raise RuntimeError("MemFabric shared HiSparse Host pool initialization failed")
         group.barrier()
@@ -73,22 +78,26 @@ class MemFabricSharedHostRegion:
                 owner = offload.empty([pool_size], dtype=torch.int8, pin_memory=True)
                 if owner.numel() != pool_size or not owner.is_contiguous():
                     raise RuntimeError("MemFabric returned an invalid shared Host allocation")
-                result = (owner.data_ptr(), None)
+                mapping = MappedHostTensor(owner, memfabric=True)
+                result = (owner.data_ptr(), mapping.device_ptr, pool_size, None)
             except Exception as error:
-                result = (None, str(error))
-        address, error = group.broadcast_object(result, src=0)
+                result = (None, None, pool_size, str(error))
+        address, device_ptr, registered_size, error = group.broadcast_object(result, src=0)
         if error is not None:
             raise RuntimeError(f"MemFabric shared Host allocation failed: {error}")
         if not address or address % mmap.PAGESIZE:
             raise RuntimeError("MemFabric shared Host address is null or not page aligned")
+        if registered_size != pool_size or not device_ptr:
+            raise RuntimeError("MemFabric shared Host mapping differs from the initialized pool")
         if not leader:
-            # Offload imported this range during initialize; this is a view, not an allocation.
+            # Metadata-only view: SDK import supplies device access, not a follower CPU mapping.
             buffer = (ctypes.c_ubyte * pool_size).from_address(address)
             owner = torch.frombuffer(buffer, dtype=torch.int8)
+            # Legacy VMM imports expose the common VA; mapped Host pools need a local DVA lookup.
+            mapping = MappedHostTensor(
+                owner, memfabric=True, shared_device_ptr=device_ptr if device_ptr == address else None
+            )
         self.base_tensor = owner
-        mapping = MappedHostTensor(owner, memfabric=True)
-        if mapping.device_ptr != address:
-            raise RuntimeError("MemFabric SHARED must expose identical Host and device addresses")
         self.base_tensor._hisparse_registration = mapping
         _shared_owners.append(owner)
 
@@ -106,13 +115,13 @@ class MemFabricSharedHostRegion:
 
 
 class MappedHostTensor:
-    """Own an ACL mapping and retain the CPU allocation until explicit close.
+    """Retain a CPU allocation with its ACL or MemFabric device mapping.
 
     Close only after all streams and graphs using this mapping have completed
     and been destroyed. No destructor unmaps memory behind asynchronous work.
     """
 
-    def __init__(self, tensor: torch.Tensor, *, memfabric: bool = False) -> None:
+    def __init__(self, tensor: torch.Tensor, *, memfabric: bool = False, shared_device_ptr: int | None = None) -> None:
         if tensor.device.type != "cpu" or not tensor.is_contiguous():
             raise ValueError("HiSparse host mapping requires a contiguous CPU tensor")
         self.tensor = tensor
@@ -120,12 +129,14 @@ class MappedHostTensor:
         self.nbytes = tensor.numel() * tensor.element_size()
         if not self.nbytes:
             raise ValueError("Cannot register an empty HiSparse host allocation")
+        if shared_device_ptr is not None and (not memfabric or shared_device_ptr != self.host_address):
+            raise ValueError("Imported SHARED mappings require identical MemFabric Host/device addresses")
         self._memfabric = memfabric
         if memfabric:
             from memfabric_hybrid import offload
 
             self.device = torch.device("npu", torch.npu.current_device())
-            self.device_ptr = offload.get_dva(self.host_address)
+            self.device_ptr = offload.get_dva(self.host_address) if shared_device_ptr is None else shared_device_ptr
             if not self.device_ptr:
                 raise RuntimeError("MemFabric did not expose a device address for HiSparse Host Source")
             self.closed = False
@@ -254,7 +265,9 @@ def install() -> None:
     def allocate_pools(vllm_config, tensor_sizes, num_blocks, host_block_stride, *, use_shared_host_pool):
         if use_shared_host_pool and isinstance(get_hisparse_backend(), AscendHiSparseBackend):
             if not uses_memfabric(vllm_config):
-                raise ValueError("Ascend shared HiSparse Host pools require HiSparsePDConnector")
+                raise ValueError(
+                    "Ascend shared HiSparse Host pools require MooncakeConnectorV2 with memfabric transport"
+                )
             region = MemFabricSharedHostRegion(tensor_sizes)
             pools = [region.create_next_canonical_view(size) for size in tensor_sizes]
             return pools, [region.base_tensor], region

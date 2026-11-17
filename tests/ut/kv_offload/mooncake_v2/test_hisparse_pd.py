@@ -5,7 +5,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.hisparse_pd import _HiSparsePDWorker, _HiSparsePullThread
+from vllm_ascend.distributed.kv_transfer.kv_p2p.hisparse_pd import (
+    _HiSparsePDWorker,
+    _HiSparsePullThread,
+    validate_hisparse_pd_config,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import MooncakePullConnectorWorker
 
 
@@ -97,7 +101,7 @@ def test_pull_rejects_different_tp_and_component_sizes():
 def test_pull_registers_producer_sources_and_consumer_destinations():
     worker = _HiSparsePDWorker.__new__(_HiSparsePDWorker)
     worker.kv_transfer_config = NS(is_kv_producer=False)
-    with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.hisparse_pd.global_memfabric_te") as engine:
+    with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.hisparse_pd.global_hisparse_te") as engine:
         worker._register_transfer_buffers([10], [20])
         engine.register_buffer.assert_called_once_with([10], [20])
         engine.register_buffer.reset_mock()
@@ -110,10 +114,37 @@ def test_pull_uses_hisparse_receiving_thread():
     assert _HiSparsePDWorker.receiving_thread_cls is _HiSparsePullThread
 
 
+def test_memfabric_layout_validation_distinguishes_p_and_d():
+    cache = NS(hisparse_host_num_blocks=None)
+    validate_hisparse_pd_config(NS(is_kv_consumer=False), cache)
+    with pytest.raises(ValueError, match="requires HiSparse Host Source"):
+        validate_hisparse_pd_config(NS(is_kv_consumer=True), cache)
+    cache.hisparse_host_num_blocks = 32
+    cache.kv_cache_groups = [
+        NS(enable_kv_transfer=True, host_resident=True, role="hisparse_source"),
+        NS(enable_kv_transfer=True, host_resident=False, role="hisparse_indexer"),
+    ]
+    validate_hisparse_pd_config(NS(is_kv_consumer=True), cache)
+    with pytest.raises(ValueError, match="ordinary Prefill KV"):
+        validate_hisparse_pd_config(NS(is_kv_consumer=False), cache)
+    cache.kv_cache_groups.pop()
+    with pytest.raises(ValueError, match="transfer groups"):
+        validate_hisparse_pd_config(NS(is_kv_consumer=True), cache)
+
+
+def test_memfabric_worker_rejects_sdma_before_engine_initialization():
+    worker = _HiSparsePDWorker.__new__(_HiSparsePDWorker)
+    worker.kv_transfer_config = NS(kv_connector_extra_config={"memfabric_transfer_protocol": "sdma"})
+    with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.hisparse_pd.global_hisparse_te") as engine:
+        with pytest.raises(ValueError, match="SDMA is disabled"):
+            worker._get_transfer_engine(None)
+        engine.get_transfer_engine.assert_not_called()
+
+
 def test_hisparse_pd_registers_full_host_pool_once_and_preserves_indexer():
     worker = _HiSparsePDWorker.__new__(_HiSparsePDWorker)
     worker._host_pool_regions = {1000: 1000}
-    with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.hisparse_pd.global_memfabric_te") as engine:
+    with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.hisparse_pd.global_hisparse_te") as engine:
         worker._register_transfer_buffers([1100, 1500, 3000], [100, 200, 400])
         engine.register_buffer.assert_called_once_with([1000, 3000], [1000, 400])
 

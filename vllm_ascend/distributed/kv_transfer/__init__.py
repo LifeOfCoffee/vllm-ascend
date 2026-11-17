@@ -95,12 +95,6 @@ def register_connector():
     )
 
     KVConnectorFactory.register_connector(
-        "HiSparsePDConnector",
-        "vllm_ascend.distributed.kv_transfer.kv_p2p.hisparse_pd",
-        "HiSparsePDConnector",
-    )
-
-    KVConnectorFactory.register_connector(
         "MooncakePullConnector",
         "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.connector",
         "MooncakePullConnector",

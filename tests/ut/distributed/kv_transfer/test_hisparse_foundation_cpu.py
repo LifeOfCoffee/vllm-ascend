@@ -169,7 +169,7 @@ def shared_offload_sdk(monkeypatch):
     import vllm.distributed as distributed
     from vllm.v1.hisparse import runtime
 
-    configs, messages, allocations = [], [], []
+    configs, messages, allocations, dva_queries = [], [], [], []
     group = NS(rank_in_group=0, world_size=2, barrier=lambda: None)
 
     def broadcast(value, src):
@@ -184,30 +184,39 @@ def shared_offload_sdk(monkeypatch):
         offset = -owner.data_ptr() % 4096
         return owner[offset : offset + shape[0]]
 
+    def get_dva(ptr):
+        dva_queries.append(group.rank_in_group)
+        if group.rank_in_group != 0:
+            raise RuntimeError("host pointer outside local contribution")
+        return ptr
+
     group.broadcast_object = broadcast
     sdk = NS(
         OffloadConfig=NS,
         Scene=NS(SHARED="shared"),
+        OFFLOAD_FLAG_GIANT_PAGE=4096,
         initialize=lambda config: configs.append(config) or 0,
         empty=allocate,
+        get_dva=get_dva,
     )
     monkeypatch.setitem(sys.modules, "memfabric_hybrid", NS(offload=sdk))
     monkeypatch.setattr(distributed, "get_tp_group", lambda: group)
     monkeypatch.setattr(runtime, "check_hisparse_host_memory", lambda size: None)
     monkeypatch.setattr(torch, "npu", NS(current_device=lambda: group.rank_in_group), raising=False)
-    monkeypatch.setattr(host_pool, "MappedHostTensor", lambda tensor, **kw: NS(device_ptr=tensor.data_ptr()))
     monkeypatch.setattr(host_pool, "_shared_owners", [])
-    return sdk, group, configs, allocations
+    return sdk, group, configs, allocations, dva_queries
 
 
 def test_shared_offload_contributes_once_and_exposes_real_zero_copy_views(shared_offload_sdk):
-    _, group, configs, allocations = shared_offload_sdk
+    _, group, configs, allocations, dva_queries = shared_offload_sdk
     leader = host_pool.MemFabricSharedHostRegion([32, 64])
     group.rank_in_group = 1
     follower = host_pool.MemFabricSharedHostRegion([32, 64])
     assert allocations == [1024**3]
     assert [config.alloc_size for config in configs] == [1024**3, 0]
+    assert all(config.flags == 4096 for config in configs)
     assert leader.base_tensor.data_ptr() == follower.base_tensor.data_ptr()
+    assert dva_queries == [0]
     first = leader.create_next_canonical_view(32)
     second = leader.create_next_canonical_view(64)
     second.fill_(19)
@@ -219,8 +228,21 @@ def test_shared_offload_contributes_once_and_exposes_real_zero_copy_views(shared
     leader.cleanup()
 
 
+def test_shared_offload_resolves_distinct_device_mapping_per_rank(shared_offload_sdk):
+    sdk, group, _, allocations, _ = shared_offload_sdk
+    sdk.get_dva = lambda ptr: ptr + (group.rank_in_group + 1) * 4096
+    leader = host_pool.MemFabricSharedHostRegion([32])
+    group.rank_in_group = 1
+    follower = host_pool.MemFabricSharedHostRegion([32])
+    assert allocations == [1024**3]
+    for region, offset in [(leader, 4096), (follower, 8192)]:
+        mapping = region.base_tensor._hisparse_registration
+        assert mapping.device_ptr == mapping.host_address + offset
+        assert mapping.address_of(region.create_next_canonical_view(32)) == mapping.device_ptr
+
+
 def test_shared_offload_allocation_error_reaches_followers(shared_offload_sdk):
-    sdk, group, _, _ = shared_offload_sdk
+    sdk, group, _, _, _ = shared_offload_sdk
 
     def fail(*args, **kwargs):
         raise RuntimeError("allocation failed")
@@ -230,6 +252,20 @@ def test_shared_offload_allocation_error_reaches_followers(shared_offload_sdk):
         host_pool.MemFabricSharedHostRegion([32])
     group.rank_in_group = 1
     with pytest.raises(RuntimeError, match="allocation failed"):
+        host_pool.MemFabricSharedHostRegion([32])
+
+
+def test_shared_offload_mapping_error_reaches_followers(shared_offload_sdk):
+    sdk, group, _, _, _ = shared_offload_sdk
+
+    def fail(ptr):
+        raise RuntimeError("device mapping unavailable")
+
+    sdk.get_dva = fail
+    with pytest.raises(RuntimeError, match="device mapping unavailable"):
+        host_pool.MemFabricSharedHostRegion([32])
+    group.rank_in_group = 1
+    with pytest.raises(RuntimeError, match="device mapping unavailable"):
         host_pool.MemFabricSharedHostRegion([32])
 
 
@@ -260,9 +296,18 @@ def test_private_host_allocator_keeps_other_backends_on_core_path(monkeypatch):
     torch.testing.assert_close(registered[:1001], payload)
 
 
-@pytest.mark.parametrize("connector,shared", [("HiSparsePDConnector", True), ("HiSparseConnector", False)])
-def test_shared_host_policy_requires_memfabric_pd(connector, shared):
-    config = NS(kv_transfer_config=NS(kv_connector=connector))
+@pytest.mark.parametrize(
+    "connector,transport,shared",
+    [
+        ("MooncakeConnectorV2", "memfabric", True),
+        ("MooncakeConnectorV2", "ascend", False),
+        ("HiSparseConnector", "memfabric", False),
+    ],
+)
+def test_shared_host_policy_requires_memfabric_pd(connector, transport, shared):
+    config = NS(
+        kv_transfer_config=NS(kv_connector=connector, kv_connector_extra_config={"mooncake_transport": transport})
+    )
     assert AscendHiSparseBackend().can_share_host_pool(config) is shared
 
 

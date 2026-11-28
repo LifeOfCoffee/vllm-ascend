@@ -1,0 +1,6 @@
+pr: 1
+entries:
+  - category: feature
+    text: >-
+      HiSparse P/D Pull over MemFabric now supports different Prefill and Decode TP sizes,
+      with PCP=1 on Decode and DCP=1 on Prefill.
